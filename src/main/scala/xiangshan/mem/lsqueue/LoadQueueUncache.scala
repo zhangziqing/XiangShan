@@ -20,6 +20,7 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
+import _root_.utils.QueueModel.{IndexFreeList, QueueRTL}
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -299,13 +300,13 @@ class LoadQueueUncache(implicit p: Parameters) extends XSModule
    ******************************************************************/
   val entries = Seq.tabulate(LoadUncacheBufferSize)(i => Module(new UncacheEntry(i)))
 
-  val freeList = Module(new FreeList(
+  val freeList = Module(new IndexFreeList(
     size = LoadUncacheBufferSize,
     allocWidth = LoadPipelineWidth,
     freeWidth = 4,
     enablePreAlloc = true,
     moduleName = "LoadQueueUncache freelist"
-  ))
+  )(p, QueueRTL))
   freeList.io := DontCare
 
   // set default IO
