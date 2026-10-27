@@ -10,18 +10,18 @@ import utility._
 
 /** Ordered free-index allocator. The Queue payload is a slot index, not the
   * object stored by the caller. Reset represents a full ring whose contents are
-  * the identity sequence `0 .. size-1`; both pointers reset so that the ring is
+  * the identity sequence `0 .. entries-1`; both pointers reset so that the ring is
   * full. This is deliberately not an ordinary reset-empty FIFO.
   *
   * Return path (baseline timing preserved):
-  *   - `free` accumulates a pending bitmap.
-  *   - A residue-class selection picks at most one pending index per
+  *   - Stage 0 requests (`free`) accumulate in the pending bitmap.
+  *   - Stage 1 selects at most one pending index per
   *     `freeWidth` residue class, excluding indices already selected.
-  *   - Selection masks and one-hot indices are registered, then enter the ring
-  *     on the following cycle. A same-cycle `free` is not an immediate
-  *     allocation candidate.
-  *   - Pending update is `(free | freeMask) & ~freeSelMask`; re-freeing a pending
-  *     index is not reference counted and is a caller contract violation.
+  *   - Stage 2 registers the selection for enqueue; stage 3 commits it to the
+  *     ring. A same-cycle `free` is not an immediate allocation candidate.
+  *   - Pending update is `(s0FreeRequest | s1PendingFree) & ~s2EnqueuingMask`;
+  *     re-freeing a pending index is not reference counted and is a caller
+  *     contract violation.
   *
   * Allocation path:
   *   - `canAllocate(i)` and `allocateSlot(i)` describe the candidate at
@@ -45,85 +45,90 @@ import utility._
   * still in the pending/registered pipeline; it is not the number of free
   * indices.
   */
-class IndexFreeListIO(size: Int, allocWidth: Int, indexW: Int, cntW: Int) extends Bundle {
+class IndexFreeListIO(entries: Int, allocWidth: Int, indexW: Int, cntW: Int) extends Bundle {
   val allocateReq = Input(Vec(allocWidth, Bool()))
   val allocateSlot = Output(Vec(allocWidth, UInt(indexW.W)))
   val canAllocate = Output(Vec(allocWidth, Bool()))
   val doAllocate = Input(Vec(allocWidth, Bool()))
 
-  val free = Input(UInt(size.W))
+  val free = Input(UInt(entries.W))
 
   val validCount = Output(UInt(cntW.W))
   val empty = Output(Bool())
 }
 
 class IndexFreeList(
-  size: Int,
+  entries: Int,
   allocWidth: Int,
   freeWidth: Int,
   enablePreAlloc: Boolean = false,
   moduleName: String = ""
 )(implicit p: Parameters, expandRTL: Field[Boolean]) extends Module with HasPerfEvents {
-  require(size >= 2, "IndexFreeList needs at least two indices")
+  require(entries >= 2, "IndexFreeList needs at least two indices")
   require(allocWidth > 0, "allocation width must be positive")
   require(freeWidth > 0, "return width must be positive")
-  require(size % freeWidth == 0, "size must be divisible by freeWidth")
+  require(entries % freeWidth == 0, "entries must be divisible by freeWidth")
 
-  val indexW = log2Up(size)
-  val cntW = log2Ceil(size + 1)
+  val indexW = log2Up(entries)
+  val cntW = log2Ceil(entries + 1)
 
-  val io = IO(new IndexFreeListIO(size, allocWidth, indexW, cntW))
+  val io = IO(new IndexFreeListIO(entries, allocWidth, indexW, cntW))
 
   if (moduleName.nonEmpty) {
-    println(s"IndexFreeList: $moduleName, size $size")
+    println(s"IndexFreeList: $moduleName, entries $entries")
   }
 
   // Only static event/preview IO crosses the child Module boundary.
-  private val ring = Module(new IndexFreeListRing(size, allocWidth, freeWidth, enablePreAlloc))
+  private val ring = Module(new IndexFreeListRing(entries, allocWidth, freeWidth, enablePreAlloc))
   ring.io.allocateReq := io.allocateReq
   ring.io.doAllocate := io.doAllocate
   io.allocateSlot := ring.io.allocateSlot
   io.canAllocate := ring.io.canAllocate
   // Preserve the original registered observation and its reset/update cone.
   // QueueStatus itself remains a combinational observation of child pointers.
-  private val freeSlotCnt = RegInit(size.U(cntW.W))
+  private val freeSlotCnt = RegInit(entries.U(cntW.W))
   freeSlotCnt := ring.io.nextFreeCount
   io.empty := freeSlotCnt === 0.U
-  io.validCount := size.U - freeSlotCnt
+  io.validCount := entries.U - freeSlotCnt
 
-  // Return-side pending bitmap and registered selection.
-  private val freeMask = RegInit(0.U(size.W))
-  private val freeSelMaskVec = Wire(Vec(freeWidth, UInt(size.W)))
-  private val freeSelMask = freeSelMaskVec.reduce(_ | _)
-  private val pending = freeMask & ~freeSelMask
+  // Stage 0: requests enter the pending bitmap at the next edge.
+  private val s0FreeRequest = io.free
+  private val s1PendingFree = RegInit(0.U(entries.W))
+  private val s2EnqueuingMaskByPort = Wire(Vec(freeWidth, UInt(entries.W)))
+  private val s2EnqueuingMask = s2EnqueuingMaskByPort.reduce(_ | _)
 
-  private def remBits(input: UInt, rem: Int): UInt =
-    VecInit((0 until size / freeWidth).map(i => input(freeWidth * i + rem))).asUInt
+  // Stage 1: select pending indices not already enqueuing in stage 2.
+  private val s1SelectableFree = s1PendingFree & ~s2EnqueuingMask
 
-  private val remFreeSelMaskVec = VecInit(Seq.tabulate(freeWidth) { rem =>
-    remBits(pending, rem)
+  private def residueBits(input: UInt, residue: Int): UInt =
+    VecInit((0 until entries / freeWidth).map(i => input(freeWidth * i + residue))).asUInt
+
+  private val s1CandidatesByPort = VecInit(Seq.tabulate(freeWidth) { residue =>
+    residueBits(s1SelectableFree, residue)
   })
-  private val remFreeSelIndexOHVec = VecInit(Seq.tabulate(freeWidth) { fport =>
-    val highIndexOH = PriorityEncoderOH(remFreeSelMaskVec(fport))
-    val freeIndexOHVec = Wire(Vec(size, Bool()))
-    freeIndexOHVec.foreach(_ := false.B)
-    for (i <- 0 until size / freeWidth) {
-      freeIndexOHVec(i * freeWidth + fport) := highIndexOH(i)
+  private val s1SelectedIndexOH = VecInit(Seq.tabulate(freeWidth) { port =>
+    val selectedResidueOH = PriorityEncoderOH(s1CandidatesByPort(port))
+    val selectedIndexOH = Wire(Vec(entries, Bool()))
+    selectedIndexOH.foreach(_ := false.B)
+    for (i <- 0 until entries / freeWidth) {
+      selectedIndexOH(i * freeWidth + port) := selectedResidueOH(i)
     }
-    freeIndexOHVec.asUInt
+    selectedIndexOH.asUInt
   })
 
-  private val freeReq = GatedRegNext(VecInit(remFreeSelMaskVec.map(_.asUInt.orR)))
-  private val freeSlotOH = GatedRegNext(remFreeSelIndexOHVec)
+  // Stage 2: registered selection drives the ring's enqueue ports.
+  private val s2EnqueueValid = GatedRegNext(VecInit(s1CandidatesByPort.map(_.asUInt.orR)))
+  private val s2EnqueueIndexOH = GatedRegNext(s1SelectedIndexOH)
 
-  freeMask := (io.free | freeMask) & ~freeSelMask
+  s1PendingFree := (s0FreeRequest | s1PendingFree) & ~s2EnqueuingMask
 
-  private val returnedSlots = freeSlotOH.map(OHToUInt(_)).toSeq
+  private val s2EnqueueIndex = s2EnqueueIndexOH.map(OHToUInt(_)).toSeq
   for (i <- 0 until freeWidth) {
-    freeSelMaskVec(i) := Mux(freeReq(i), freeSlotOH(i), 0.U(size.W))
+    s2EnqueuingMaskByPort(i) := Mux(s2EnqueueValid(i), s2EnqueueIndexOH(i), 0.U(entries.W))
   }
-  ring.io.freeReq := freeReq
-  ring.io.freeSlot := VecInit(returnedSlots)
+  ring.io.enqueueValid := s2EnqueueValid
+  ring.io.enqueueIndex := VecInit(s2EnqueueIndex)
+  // Stage 3: the next edge commits these indices and the ring's tail together.
 
   // Retain the baseline debug counter and two-cycle hardware event.
   XSPerfAccumulate("empty", io.empty)
@@ -137,9 +142,9 @@ class IndexFreeList(
   * Keep legacy sparse-port write priority and chained pointer additions.
   */
 private[QueueModel] class IndexFreeListRing(
-  size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean
+  entries: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean
 )(implicit p: Parameters, expandRTL: Field[Boolean])
-    extends ElementQueue[UInt](UInt(log2Up(size).W), size) with QueueStatus {
+    extends ElementQueue[UInt](UInt(log2Up(entries).W), entries) with QueueStatus {
   override protected def enqPtrInit: QueuePtr = {
     val ptr = Wire(new QueuePtr)
     ptr.value := 0.U
@@ -147,29 +152,29 @@ private[QueueModel] class IndexFreeListRing(
     ptr
   }
   override protected def initContents: Option[Seq[UInt]] =
-    Some(Seq.tabulate(size)(i => i.U(log2Up(size).W)))
+    Some(Seq.tabulate(entries)(i => i.U(log2Up(entries).W)))
 
   val io = IO(new Bundle {
     val allocateReq = Input(Vec(allocWidth, Bool()))
     val doAllocate = Input(Vec(allocWidth, Bool()))
-    val allocateSlot = Output(Vec(allocWidth, UInt(log2Up(size).W)))
+    val allocateSlot = Output(Vec(allocWidth, UInt(log2Up(entries).W)))
     val canAllocate = Output(Vec(allocWidth, Bool()))
-    val freeReq = Input(Vec(freeWidth, Bool()))
-    val freeSlot = Input(Vec(freeWidth, UInt(log2Up(size).W)))
-    val nextFreeCount = Output(UInt(log2Ceil(size + 1).W))
+    val enqueueValid = Input(Vec(freeWidth, Bool()))
+    val enqueueIndex = Input(Vec(freeWidth, UInt(log2Up(entries).W)))
+    val nextFreeCount = Output(UInt(log2Ceil(entries + 1).W))
   })
 
   private val headPtrNext = deqPtr + PopCount(io.doAllocate)
-  private val tailPtrNext = enqPtr + PopCount(io.freeReq)
-  when(io.doAllocate.asUInt.orR) { deqPtrReg := headPtrNext }
-  when(io.freeReq.asUInt.orR) { enqPtrReg := tailPtrNext }
+  private val tailPtrNext = enqPtr + PopCount(io.enqueueValid)
+  when(io.doAllocate.asUInt.orR) { deqPtr := headPtrNext }
+  when(io.enqueueValid.asUInt.orR) { enqPtr := tailPtrNext }
 
   // Retain the original per-port destination/rank and last-write priority.
   for (i <- 0 until freeWidth) {
-    val destination = (enqPtr + PopCount(io.freeReq.take(i))).value
+    val destination = (enqPtr + PopCount(io.enqueueValid.take(i))).value
     update { entry =>
-      when(io.freeReq(i) && destination === physicalSlot(entry).U) {
-        entry := io.freeSlot(i)
+      when(io.enqueueValid(i) && destination === physicalSlot(entry).U) {
+        entry := io.enqueueIndex(i)
       }
     }
   }
