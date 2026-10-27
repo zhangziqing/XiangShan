@@ -139,7 +139,7 @@ abstract class RingQueue[T <: Data](
     */
   protected def enq(elements: Seq[T], count: UInt): Unit = {
     enqueueBatch = () => {
-      when(!recoverWire && !flushWire) { enqPtrReg := enqPtr + count }
+      when(!recoverWire && !flushWire) { enqPtr := enqPtr + count }
       // Decode destinations once; the final batch owns each recycled entry.
       val valid = elements.indices.map(i => i.U < count)
       val destOH = elements.indices.map(i => UIntToOH((enqPtr + i.U).value, entries))
@@ -160,7 +160,7 @@ abstract class RingQueue[T <: Data](
     */
   protected def deq(count: UInt): Unit = {
     when(!flushWire) {
-      deqPtrReg := deqPtr + count
+      deqPtr := deqPtr + count
     }
   }
 
@@ -172,7 +172,7 @@ abstract class RingQueue[T <: Data](
   protected def recover(target: QueuePtr, enable: Bool): Unit = {
     recoverWire := enable
     when(enable && !flushWire) {
-      enqPtrReg := target
+      enqPtr := target
     }
   }
 
@@ -182,8 +182,8 @@ abstract class RingQueue[T <: Data](
   protected def flush(enable: Bool): Unit = {
     flushWire := enable
     when(enable) {
-      enqPtrReg := 0.U.asTypeOf(new QueuePtr)
-      deqPtrReg := 0.U.asTypeOf(new QueuePtr)
+      enqPtr := 0.U.asTypeOf(new QueuePtr)
+      deqPtr := 0.U.asTypeOf(new QueuePtr)
     }
   }
 

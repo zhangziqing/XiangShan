@@ -7,6 +7,9 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.{CircularQueuePtr, HasCircularQueuePtrHelper}
 
+/** Circuit-selection key supplied explicitly by MemBlock model callers. */
+case object QueueRTL extends Field[Boolean](true)
+
 /** Owns only the two circular pointers and declares element-access contracts.
   * Payload, IO, admission, access lowering and recovery belong to a concrete
   * Queue implementation.
@@ -32,10 +35,8 @@ abstract class QueueBase[T <: Data](val entries: Int)(
   protected def enqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
   protected def deqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
 
-  protected val enqPtrReg: QueuePtr = RegInit(enqPtrInit)
-  protected val deqPtrReg: QueuePtr = RegInit(deqPtrInit)
-  protected def enqPtr: QueuePtr = enqPtrReg
-  protected def deqPtr: QueuePtr = deqPtrReg
+  protected val enqPtr: QueuePtr = RegInit(enqPtrInit)
+  protected val deqPtr: QueuePtr = RegInit(deqPtrInit)
 
   /** Observe current elements at the call site, without saving the callback.
     * The read-only callback supplies its own guards; the Queue adds no
