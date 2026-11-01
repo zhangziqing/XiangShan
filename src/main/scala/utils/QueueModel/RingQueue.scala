@@ -56,9 +56,11 @@ abstract class QueueBaseIO[T <: Data](gen: T, entries: Int, numDeq: Int)
   * overrides `initContents`. Partial literals may reset only entry metadata;
   * initializing contents does not change the pointer interval.
   *
-  * Enqueue accepts a per-port acceptance mask and appends only accepted
-  * elements, preserving port order. Dequeue consumes a head prefix. Callers
-  * own capacity/ownership legality; this core does not clamp either transfer.
+  * Enqueue of Valid elements uses an overridable admission policy. By default,
+  * all valid inputs enter together when current free space holds the group;
+  * same-cycle dequeue does not provide admission credit. The explicit-mask
+  * overload leaves capacity/ownership legality to the caller. Both append
+  * accepted elements in port order. Dequeue consumes a caller-selected prefix.
   *
   * Core priority, in decreasing order:
   *   1. `flush` clears membership at the edge; current-cycle outputs still
@@ -175,6 +177,31 @@ abstract class RingQueue[T <: Data](
     this
   }
 
+  /** Admission policy for Valid inputs. The default accepts every valid port
+    * together or rejects the whole group, using current occupancy only. The
+    * widened sum cannot overflow before comparison with the capacity.
+    * Overrides return one decision per input and accept only valid ports.
+    */
+  protected def accept(elements: Seq[ValidIO[T]]): Seq[Bool] = {
+    val canAccept = (count +& PopCount(elements.map(_.valid))) <= entries.U
+    elements.map(element => element.valid && canAccept && !recoverWire && !flushWire)
+  }
+
+  /** Offer Valid elements and observe the ports that actually enter this cycle.
+    * The policy is evaluated at the construction boundary. Flush/recovery
+    * suppress every policy, and a replaced registration returns all false.
+    */
+  protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool] = {
+    require(elements.nonEmpty, "enqueue needs at least one input")
+    require(elements.length <= numEnq, "enqueue exceeds the configured port count")
+    val accepted = Seq.fill(elements.length)(WireDefault(false.B))
+    enqConfig = () => {
+      val result = enqImpl(elements.map(_.bits), accept(elements))
+      accepted.zip(result).foreach { case (out, in) => out := in }
+    }
+    accepted
+  }
+
   /** Append accepted elements in port order, without holes in membership.
     * Acceptance, including capacity and handshake decisions, belongs to the
     * caller. Each accepted port writes at tail + its accepted-prefix count;
@@ -195,7 +222,8 @@ abstract class RingQueue[T <: Data](
     enqConfig = () => enqImpl(elements, accepted)
   }
 
-  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Seq[Bool] = {
+    require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     when(!recoverWire && !flushWire && VecInit(accepted).asUInt.orR) {
       enqPtr := enqPtr + PopCount(accepted)
     }
@@ -207,6 +235,7 @@ abstract class RingQueue[T <: Data](
         }
       }
     }
+    accepted.map(_ && !recoverWire && !flushWire)
   }
 
   /** Remove `count` oldest entries. Payload is read separately through the
