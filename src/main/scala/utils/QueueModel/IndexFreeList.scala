@@ -144,7 +144,7 @@ class IndexFreeList(
 private[QueueModel] class IndexFreeListRing(
   entries: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean
 )(implicit p: Parameters, expandRTL: Field[Boolean])
-    extends ElementQueue[UInt](UInt(log2Up(entries).W), entries) with QueueStatus {
+    extends RingQueue[UInt](UInt(log2Up(entries).W), entries, freeWidth, allocWidth) {
   override protected def enqPtrInit: QueuePtr = {
     val ptr = Wire(new QueuePtr)
     ptr.value := 0.U
@@ -166,19 +166,10 @@ private[QueueModel] class IndexFreeListRing(
 
   private val headPtrNext = deqPtr + PopCount(io.doAllocate)
   private val tailPtrNext = enqPtr + PopCount(io.enqueueValid)
-  when(io.doAllocate.asUInt.orR) { deqPtr := headPtrNext }
-  when(io.enqueueValid.asUInt.orR) { enqPtr := tailPtrNext }
-
-  // Retain the original per-port destination/rank and last-write priority.
-  for (i <- 0 until freeWidth) {
-    val destination = (enqPtr + PopCount(io.enqueueValid.take(i))).value
-    update { entry =>
-      when(io.enqueueValid(i) && destination === physicalSlot(entry).U) {
-        entry := io.enqueueIndex(i)
-      }
-    }
-  }
-  emitElementUpdates()
+  when(io.doAllocate.asUInt.orR) { deq(PopCount(io.doAllocate)) }
+  // RingQueue appends sparse returns in port order with the original priority.
+  enq(io.enqueueIndex.toSeq, io.enqueueValid.toSeq)
+  emitRTL()
 
   // Vec indexing preserves the reference read mux, including invalid lanes.
   private val elements = scala.collection.mutable.ArrayBuffer.empty[UInt]
