@@ -147,7 +147,7 @@ abstract class RingQueue[T <: Data](
   private val flushWire = WireDefault(false.B)
 
   // Register enqueue logic now and expand it at the owning Module's emission boundary.
-  private var emitEnqueueRTL: () => Unit = () => ()
+  private var enqCallback: () => Unit = () => ()
 
   protected final def flushActive: Bool = flushWire
 
@@ -170,7 +170,7 @@ abstract class RingQueue[T <: Data](
     * expression, before Chisel closes it.
     */
   final def emitRTL(): this.type = {
-    emitEnqueueRTL()
+    enqCallback()
     emitElementUpdates()
     this
   }
@@ -192,7 +192,7 @@ abstract class RingQueue[T <: Data](
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    emitEnqueueRTL = () => {
+    enqCallback = () => {
       when(!recoverWire && !flushWire && VecInit(accepted).asUInt.orR) {
         enqPtr := enqPtr + PopCount(accepted)
       }
