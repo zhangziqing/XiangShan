@@ -66,10 +66,10 @@ abstract class QueueBaseIO[T <: Data](gen: T, entries: Int, numDeq: Int)
   *   2. `recover` installs a target tail and suppresses enqueue, even when the
   *      target equals the old tail; dequeue proceeds independently.
   *   3. Core enqueue and dequeue commit together. The last `enq` registration
-  *      owns the whole accepted batch. Its pointer step and payload writes are
+  *      supplies the enqueue logic. Its pointer step and payload writes are
   *      emitted together after element updates, so a full-entry replacement
   *      always wins a recycled-slot RMW and a final empty mask suppresses
-  *      every earlier batch.
+  *      every earlier registration.
   *
   * Update functions are assumed pure and accumulated by ordered composition.
   * The caller explicitly expands the composite with `emitRTL` after completing
@@ -146,7 +146,8 @@ abstract class RingQueue[T <: Data](
   private val recoverWire = WireDefault(false.B)
   private val flushWire = WireDefault(false.B)
 
-  private var enqueueBatch: () => Unit = () => ()
+  // Register enqueue logic now and expand it at the owning Module's emission boundary.
+  private var emitEnqueueRTL: () => Unit = () => ()
 
   protected final def flushActive: Bool = flushWire
 
@@ -164,12 +165,12 @@ abstract class RingQueue[T <: Data](
     * while this Queue is still being constructed inside `Module(...)`:
     * `Module(new SomeQueue(...).emitRTL())`.
     *
-    * Expansion orders element updates before the final enqueue batch. Returning
+    * Expansion orders element updates before the final enqueue writes. Returning
     * this instance keeps generation inside the owning Module's construction
     * expression, before Chisel closes it.
     */
   final def emitRTL(): this.type = {
-    enqueueBatch()
+    emitEnqueueRTL()
     emitElementUpdates()
     this
   }
@@ -181,7 +182,8 @@ abstract class RingQueue[T <: Data](
     * Under the capacity contract the destinations are distinct. If a caller
     * violates that contract, later ports retain last-enabled-write priority.
     *
-    * The latest call replaces the whole saved batch, including an empty batch.
+    * The latest call replaces the registered enqueue logic, including an
+    * all-false acceptance mask that suppresses every earlier registration.
     * Its payload writes override earlier element updates at recycled slots,
     * and its pointer step commits at the same edge. Flush/recovery suppress
     * both effects. Destination arithmetic is shared outside the entry loop.
@@ -190,7 +192,7 @@ abstract class RingQueue[T <: Data](
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqueueBatch = () => {
+    emitEnqueueRTL = () => {
       when(!recoverWire && !flushWire && VecInit(accepted).asUInt.orR) {
         enqPtr := enqPtr + PopCount(accepted)
       }
