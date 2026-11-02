@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Pointer-only Module foundation and pointer-derived Queue observations.
 package utils.QueueModel
 
 import chisel3._
@@ -7,26 +6,18 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.{CircularQueuePtr, HasCircularQueuePtrHelper}
 
-/** Circuit-selection key supplied explicitly by MemBlock model callers. */
+/** Select ordinary QueueModel circuit generation. */
 case object QueueRTL extends Field[Boolean](true)
 
-/** Owns only the two circular pointers and declares element-access contracts.
-  * Payload, IO, admission, access lowering and recovery belong to a concrete
-  * Queue implementation.
-  *
-  * `p(expandRTL)` selects ordinary circuit expansion. The alternative circuit
-  * is deliberately unspecified; implementations must reject it until supplied.
-  * Reset-full places the tail one phase ahead of the head at the same index.
-  */
+/** Owns the circular enqueue/dequeue pointers; subclasses provide payload storage. */
 abstract class QueueBase[T <: Data](val entries: Int)(
   implicit val p: Parameters,
   val expandRTL: Field[Boolean]
 ) extends Module {
   require(entries > 0, "Queue capacity must be positive")
 
-  /** Bound to this Queue's capacity. `flag` is the circular ordering phase,
-    * never an element-valid bit. A single-slot pointer has zero index bits,
-    * leaving its phase as the entire pointer for inherited arithmetic.
+  /** Use the wrap phase to distinguish full from empty at the same index.
+    * A single-slot queue needs only the phase bit.
     */
   protected class QueuePtr extends CircularQueuePtr[QueuePtr](QueueBase.this.entries) {
     override val value = UInt(log2Ceil(QueueBase.this.entries).W)
@@ -38,28 +29,20 @@ abstract class QueueBase[T <: Data](val entries: Int)(
   protected val enqPtr: QueuePtr = RegInit(enqPtrInit)
   protected val deqPtr: QueuePtr = RegInit(deqPtrInit)
 
-  /** Observe current elements at the call site, without saving the callback.
-    * The read-only callback supplies its own guards; the Queue adds no
-    * membership filter.
-    */
+  /** Read all physical slots now; apply any validity guard in the callback. */
   protected def foreach(read: T => Unit): Unit
 
-  /** Compose element updates under the pure-function assumption:
-    * update(f); update(g) = update(compose(f, g)). Reads observe current state;
-    * field-wise, last-enabled-write priority is preserved at the cycle edge.
-    * The concrete implementation supplies an explicit circuit emission step.
+  /** Register per-entry writes for later emission. Reads see current state;
+    * later enabled writes win per field.
     */
   protected def update(modify: T => Unit): Unit
 
-  /** OR the caller's predicate over current storage elements. The predicate
-    * supplies any validity test required by the concrete Queue contract.
-    */
+  /** Test all physical slots; include any validity check in the predicate. */
   protected def exists(predicate: T => Bool): Bool
 }
 
-/** Observations for a Queue whose live interval is [deqPtr, enqPtr).
-  * The pointers must remain ordered with distance at most `entries`. This
-  * trait adds combinational expressions only and cannot be mixed into an IO.
+/** Derive occupancy from the live interval [deqPtr, enqPtr).
+  * Requires a pointer distance of at most `entries`.
   */
 trait QueueStatus extends HasCircularQueuePtrHelper { this: QueueBase[_] =>
   protected final def count: UInt = {
