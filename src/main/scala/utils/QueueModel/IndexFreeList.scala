@@ -131,17 +131,13 @@ private[QueueModel] class IndexFreeListRing(
   enq(io.enqueueIndex.toSeq, io.enqueueValid.toSeq)
   emitRTL()
 
-  // Keep Vec's read semantics even for unavailable candidates.
-  private val elements = scala.collection.mutable.ArrayBuffer.empty[UInt]
-  foreach { entry => elements += entry }
-  private val readView = VecInit(elements.toSeq)
   for (i <- 0 until allocWidth) {
     // Preallocation previews from the head after this cycle's allocations.
     val base = if (enablePreAlloc) headPtrNext else deqPtr
     // Keep pointer steps separate to preserve non-power-of-two wrap behavior.
     val candidate = base + PopCount(io.allocateReq.take(i))
     val available = isBefore(candidate, enqPtr)
-    val payload = readView(candidate.value)
+    val payload = read(candidate.value)
     if (enablePreAlloc) {
       // Register next-cycle candidates; outputs have no reset value.
       io.canAllocate(i) := RegEnable(available, true.B)

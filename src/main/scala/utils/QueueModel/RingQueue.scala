@@ -2,6 +2,7 @@
 package utils.QueueModel
 
 import chisel3._
+import chisel3.Data._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
@@ -32,6 +33,10 @@ abstract class RingQueue[T <: Data](
   }
   private var modifyElement: T => Unit = _ => ()
   private var emitted = false
+
+  /** Read current storage without exposing an assignment destination. */
+  protected final def read(index: Int): T = contents(index).readOnly
+  protected final def read(index: UInt): T = contents(index).readOnly
 
   protected final def compose(first: T => Unit, second: T => Unit): T => Unit =
     entry => { first(entry); second(entry) }
@@ -85,9 +90,7 @@ abstract class RingQueue[T <: Data](
   /** Read the oldest `numDeq` slots; payload is unspecified beyond occupancy. */
   protected final val deqData: Seq[T] = (0 until numDeq).map { offset =>
     val index = (deqPtr + offset.U).value
-    val choices = scala.collection.mutable.ArrayBuffer.empty[(Bool, T)]
-    foreach { entry => choices += ((index === physicalSlot(entry).U) -> entry) }
-    Mux1H(choices.toSeq)
+    read(index)
   }
 
   /** Emit registered updates once, with enqueue writes taking priority.
