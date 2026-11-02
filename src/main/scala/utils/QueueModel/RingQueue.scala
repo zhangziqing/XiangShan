@@ -85,7 +85,7 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqConfig: () => Unit = () => ()
+  private var enqCallback: () => Unit = () => ()
 
   /** Read the oldest `numDeq` slots; payload is unspecified beyond occupancy. */
   protected final val deqData: Seq[T] = (0 until numDeq).map { offset =>
@@ -100,31 +100,26 @@ abstract class RingQueue[T <: Data](
     * `Module(new SomeQueue(...).emitRTL())`.
     */
   final def emitRTL(): this.type = {
-    enqConfig()
+    enqCallback()
     emitElementUpdates()
     this
   }
 
   /** Accept all valid inputs together if they fit, using space before dequeue.
-    * Overrides must return one decision per input and reject invalid ports.
+    * Overrides must return one decision per input and reject invalid ports,
+    * flush and recovery.
     */
   protected def accept(elements: Seq[ValidIO[T]]): Seq[Bool] = {
     val canAccept = (count +& PopCount(elements.map(_.valid))) <= entries.U
     elements.map(element => element.valid && canAccept && !recover && !flush)
   }
 
-  /** Register Valid inputs and return their actual acceptance for this cycle.
-    * Flush or recovery forces false. A later `enq` call cancels this registration,
-    * leaving its result false.
+  /** Return this batch's admission decision and register its enqueue.
+    * A later `enq` replaces the writes without cancelling this decision.
     */
   protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool] = {
-    require(elements.nonEmpty, "enqueue needs at least one input")
-    require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    val accepted = Seq.fill(elements.length)(WireDefault(false.B))
-    enqConfig = () => {
-      val result = enqImpl(elements.map(_.bits), accept(elements))
-      accepted.zip(result).foreach { case (out, in) => out := in }
-    }
+    val accepted = accept(elements)
+    enq(elements.map(_.bits), accepted)
     accepted
   }
 
@@ -138,11 +133,10 @@ abstract class RingQueue[T <: Data](
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqConfig = () => enqImpl(elements, accepted)
+    enqCallback = () => enqImpl(elements, accepted)
   }
 
-  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Seq[Bool] = {
-    require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
+  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Unit = {
     when(!recover && !flush && VecInit(accepted).asUInt.orR) {
       enqPtr := enqPtr + PopCount(accepted)
     }
@@ -155,7 +149,6 @@ abstract class RingQueue[T <: Data](
         }
       }
     }
-    accepted.map(_ && !recover && !flush)
   }
 
   /** Consume the oldest `count` entries by advancing the head.
