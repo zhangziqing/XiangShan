@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Dense circular Queue core with element-oriented extension callbacks.
 package utils.QueueModel
 
 import chisel3._
@@ -18,24 +17,21 @@ trait QueueDequeue[T <: Data] {
   def deq: Vec[DecoupledIO[T]]
 }
 
-/** An existing input port; this trait allocates neither IO nor state. */
 trait Flushable {
   def flush: Bool
 }
 
-/** Request shape belongs to the concrete interface, not an internal specuPtr. */
 trait SpeculativeRecovery[R <: Data] {
   def recover: ValidIO[R]
 }
 
-/** IO observation fields; computation belongs to the QueueStatus mixin. */
 trait QueueStatusIO {
   def count: UInt
   def empty: Bool
   def full: Bool
 }
 
-/** The common IO deliberately leaves the enqueue protocol to the concrete IO. */
+/** Shared dequeue and status ports; subclasses choose the enqueue protocol. */
 abstract class QueueBaseIO[T <: Data](gen: T, entries: Int, numDeq: Int)
     extends Bundle with QueueDequeue[T] with QueueStatusIO {
   val deq = Vec(numDeq, Decoupled(gen))
@@ -44,41 +40,8 @@ abstract class QueueBaseIO[T <: Data](gen: T, entries: Int, numDeq: Int)
   val full = Output(Bool())
 }
 
-/** A payload-bearing dense Queue owns its state, control and element extensions.
-  *
-  * Membership is exactly the circular interval `[deqPtr, enqPtr)`; it has no
-  * holes and no independent occupancy register. Pointers carry unsigned value
-  * bits plus one wrap flag, so non-power-of-two capacities wrap without binary
-  * truncation. `count`, `empty` and `full` are derived from the pointers.
-  *
-  * Pointer reset values come from `enqPtrInit` and `deqPtrInit`. Payload
-  * registers are deliberately unreset unless a concrete specialization
-  * overrides `initContents`. Partial literals may reset only entry metadata;
-  * initializing contents does not change the pointer interval.
-  *
-  * Enqueue of Valid elements uses an overridable admission policy. By default,
-  * all valid inputs enter together when current free space holds the group;
-  * same-cycle dequeue does not provide admission credit. The explicit-mask
-  * overload leaves capacity/ownership legality to the caller. Both append
-  * accepted elements in port order. Dequeue consumes a caller-selected prefix.
-  *
-  * Core priority, in decreasing order:
-  *   1. `flush` clears membership at the edge; current-cycle outputs still
-  *      describe old state, and admission is suppressed in that cycle.
-  *   2. `recover` installs a target tail and suppresses enqueue, even when the
-  *      target equals the old tail; dequeue proceeds independently.
-  *   3. Core enqueue and dequeue commit together. The last `enq` registration
-  *      supplies the enqueue logic. Its pointer step and payload writes are
-  *      emitted together after element updates, so a full-entry replacement
-  *      always wins a recycled-slot RMW and a final empty mask suppresses
-  *      every earlier registration.
-  *
-  * Update functions are assumed pure and accumulated by ordered composition.
-  * The caller explicitly expands the composite with `emitRTL` after completing
-  * construction; read-only observers expand at their call sites. Both receive
-  * current payload at every physical slot, including unallocated slots, without
-  * implicit guards or slot arguments. Callers supply validity guards. Purity
-  * and ambient construction context are not inspected or captured.
+/** FIFO storage with live entries in `[deqPtr, enqPtr)`.
+  * Subclasses define IO and register updates before calling `emitRTL`.
   */
 abstract class RingQueue[T <: Data](
   gen: T,
@@ -90,9 +53,9 @@ abstract class RingQueue[T <: Data](
   require(numEnq > 0, "Queue needs at least one enqueue port")
   require(numDeq > 0, "Queue needs at least one dequeue port")
 
-  /** Evaluated during superclass construction. Partial literals reset only
-    * specified fields; other payload fields remain unreset, including writes
-    * concurrent with reset. Contents do not determine pointer membership.
+  /** Override to reset payload contents; the default leaves them unreset.
+    * Evaluated during superclass construction, before subclass fields initialize.
+    * Partial literals reset only the specified fields.
     */
   protected def initContents: Option[Seq[T]] = None
 
@@ -110,10 +73,7 @@ abstract class RingQueue[T <: Data](
 
   override protected final def foreach(read: T => Unit): Unit = contents.foreach(read)
 
-  /** Conditions must be inside the callback: ambient Chisel when scopes are
-    * not captured for later expansion. Field-wise last-enabled-write priority
-    * applies; every right-hand-side expression still reads the old entry.
-    */
+  /** Put Chisel conditions inside the callback; it runs later in `emitRTL`. */
   override protected final def update(modify: T => Unit): Unit = {
     require(!emitted, "element updates must be registered before emission")
     modifyElement = compose(modifyElement, modify)
@@ -125,20 +85,13 @@ abstract class RingQueue[T <: Data](
     result
   }
 
-  /** Call once after all inherited and concrete update registrations, while
-    * constructing the owning Module. This does not gate writes on reset.
-    */
   private def emitElementUpdates(): Unit = {
     require(!emitted, "element updates must be emitted exactly once")
     emitted = true
     foreach(modifyElement)
   }
 
-  /** Elaboration-time slot identity for generic QueueModel circuit lowering.
-    * This returns neither entry state nor an addressable storage handle. Entry
-    * observations and writes still occur exclusively in foreach/update bodies.
-    * External specializations can carry an immutable slot field in their entry.
-    */
+  /** Find a callback entry's slot index while generating the circuit. */
   private[QueueModel] final def physicalSlot(entry: T): Int = {
     val slot = contents.indexWhere(_ eq entry)
     require(slot >= 0, "slot identity requires this Queue's callback entry")
@@ -148,14 +101,11 @@ abstract class RingQueue[T <: Data](
   private val recoverWire = WireDefault(false.B)
   private val flushWire = WireDefault(false.B)
 
-  // Register enqueue logic now and expand it at the owning Module's emission boundary.
   private var enqConfig: () => Unit = () => ()
 
   protected final def flushActive: Bool = flushWire
 
-  /** Ordered head window, fixed by the dequeue width. Invalid lanes have no
-    * payload guarantee. This does not provide arbitrary-address access.
-    */
+  /** Read the oldest `numDeq` slots; payload is unspecified beyond occupancy. */
   protected final val deqData: Seq[T] = (0 until numDeq).map { offset =>
     val index = (deqPtr + offset.U).value
     val choices = scala.collection.mutable.ArrayBuffer.empty[(Bool, T)]
@@ -163,13 +113,11 @@ abstract class RingQueue[T <: Data](
     Mux1H(choices.toSeq)
   }
 
-  /** Call once after all inherited and concrete updates/transfers are defined,
-    * while this Queue is still being constructed inside `Module(...)`:
-    * `Module(new SomeQueue(...).emitRTL())`.
+  /** Emit registered updates once, with enqueue writes taking priority.
+    * Call after the subclass has registered its updates and transfers.
     *
-    * Expansion orders element updates before the final enqueue writes. Returning
-    * this instance keeps generation inside the owning Module's construction
-    * expression, before Chisel closes it.
+    * Keep emission inside Module construction, e.g.
+    * `Module(new SomeQueue(...).emitRTL())`.
     */
   final def emitRTL(): this.type = {
     enqConfig()
@@ -177,19 +125,17 @@ abstract class RingQueue[T <: Data](
     this
   }
 
-  /** Admission policy for Valid inputs. The default accepts every valid port
-    * together or rejects the whole group, using current occupancy only. The
-    * widened sum cannot overflow before comparison with the capacity.
-    * Overrides return one decision per input and accept only valid ports.
+  /** Accept all valid inputs together if they fit, using space before dequeue.
+    * Overrides must return one decision per input and reject invalid ports.
     */
   protected def accept(elements: Seq[ValidIO[T]]): Seq[Bool] = {
     val canAccept = (count +& PopCount(elements.map(_.valid))) <= entries.U
     elements.map(element => element.valid && canAccept && !recoverWire && !flushWire)
   }
 
-  /** Offer Valid elements and observe the ports that actually enter this cycle.
-    * The policy is evaluated at the construction boundary. Flush/recovery
-    * suppress every policy, and a replaced registration returns all false.
+  /** Register Valid inputs and return their actual acceptance for this cycle.
+    * Flush or recovery forces false. A later `enq` call cancels this registration,
+    * leaving its result false.
     */
   protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool] = {
     require(elements.nonEmpty, "enqueue needs at least one input")
@@ -202,18 +148,11 @@ abstract class RingQueue[T <: Data](
     accepted
   }
 
-  /** Append accepted elements in port order, without holes in membership.
-    * Acceptance, including capacity and handshake decisions, belongs to the
-    * caller. Each accepted port writes at tail + its accepted-prefix count;
-    * data stays on its original port instead of crossing a separate packer.
-    * Under the capacity contract the destinations are distinct. If a caller
-    * violates that contract, later ports retain last-enabled-write priority.
+  /** Append accepted ports in order; the caller is responsible for capacity.
+    * Only the last `enq` call takes effect, even if every acceptance bit is false.
     *
-    * The latest call replaces the registered enqueue logic, including an
-    * all-false acceptance mask that suppresses every earlier registration.
-    * Its payload writes override earlier element updates at recycled slots,
-    * and its pointer step commits at the same edge. Flush/recovery suppress
-    * both effects. Destination arithmetic is shared outside the entry loop.
+    * Enqueue writes override element updates. Flush or recovery suppresses
+    * both the writes and tail advance.
     */
   protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
     require(elements.nonEmpty, "enqueue needs at least one input")
@@ -228,6 +167,7 @@ abstract class RingQueue[T <: Data](
       enqPtr := enqPtr + PopCount(accepted)
     }
     for (i <- elements.indices) {
+      // Share each port's destination calculation across all physical slots.
       val destination = (enqPtr + PopCount(accepted.take(i))).value
       update { entry =>
         when(!recoverWire && !flushWire && accepted(i) && destination === physicalSlot(entry).U) {
@@ -238,9 +178,8 @@ abstract class RingQueue[T <: Data](
     accepted.map(_ && !recoverWire && !flushWire)
   }
 
-  /** Remove `count` oldest entries. Payload is read separately through the
-    * pointer or dequeue ports before the edge; removal itself only advances the
-    * head. The count must not exceed current occupancy.
+  /** Consume the oldest `count` entries by advancing the head.
+    * The caller must keep count within current occupancy.
     */
   protected def deq(count: UInt): Unit = {
     when(!flushWire) {
@@ -248,10 +187,9 @@ abstract class RingQueue[T <: Data](
     }
   }
 
-  /** Restore the exclusive tail position, including its circular phase.
-    * Recovery suppresses enqueue even when the target is unchanged; dequeue
-    * proceeds independently. The caller places the target between the surviving
-    * head and old tail, preserving a dense interval of at most `entries`.
+  /** Restore the tail to discard newer entries, suppressing enqueue.
+    * The target must lie between the surviving head and old tail.
+    * Dequeue still proceeds during recovery.
     */
   protected def recover(target: QueuePtr, enable: Bool): Unit = {
     recoverWire := enable
@@ -260,8 +198,8 @@ abstract class RingQueue[T <: Data](
     }
   }
 
-  /** Synchronous clear. Outputs continue to observe old state in this cycle;
-    * flush wins over enqueue, recovery and dequeue advancement at the edge.
+  /** Empty the queue at the next edge, overriding other pointer updates.
+    * Current-cycle reads still see the old state.
     */
   protected def flush(enable: Bool): Unit = {
     flushWire := enable
