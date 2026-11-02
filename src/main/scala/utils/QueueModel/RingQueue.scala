@@ -5,41 +5,6 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
-trait DecoupledEnqueue[T <: Data] {
-  def enq: Vec[DecoupledIO[T]]
-}
-
-trait ValidEnqueue[T <: Data] {
-  def enq: Vec[ValidIO[T]]
-}
-
-trait QueueDequeue[T <: Data] {
-  def deq: Vec[DecoupledIO[T]]
-}
-
-trait Flushable {
-  def flush: Bool
-}
-
-trait SpeculativeRecovery[R <: Data] {
-  def recover: ValidIO[R]
-}
-
-trait QueueStatusIO {
-  def count: UInt
-  def empty: Bool
-  def full: Bool
-}
-
-/** Shared dequeue and status ports; subclasses choose the enqueue protocol. */
-abstract class QueueBaseIO[T <: Data](gen: T, entries: Int, numDeq: Int)
-    extends Bundle with QueueDequeue[T] with QueueStatusIO {
-  val deq = Vec(numDeq, Decoupled(gen))
-  val count = Output(UInt(log2Ceil(entries + 1).W))
-  val empty = Output(Bool())
-  val full = Output(Bool())
-}
-
 /** FIFO storage with live entries in `[deqPtr, enqPtr)`.
   * Subclasses define IO and register updates before calling `emitRTL`.
   */
@@ -98,12 +63,24 @@ abstract class RingQueue[T <: Data](
     slot
   }
 
-  private val recoverWire = WireDefault(false.B)
-  private val flushWire = WireDefault(false.B)
+  /** Flush clears both pointers; recovery restores an exclusive tail.
+    * Recovery suppresses enqueue, while dequeue proceeds. Set recoverPtr to a
+    * target between the surviving head and old tail. Unconnected controls are
+    * inactive; current-cycle reads still observe old state.
+    */
+  protected val flush: Bool = WireDefault(false.B)
+  protected val recover: Bool = WireDefault(false.B)
+  protected val recoverPtr: QueuePtr = WireDefault(enqPtr)
+
+  when(recover && !flush) {
+    enqPtr := recoverPtr
+  }
+  when(flush) {
+    enqPtr := 0.U.asTypeOf(new QueuePtr)
+    deqPtr := 0.U.asTypeOf(new QueuePtr)
+  }
 
   private var enqConfig: () => Unit = () => ()
-
-  protected final def flushActive: Bool = flushWire
 
   /** Read the oldest `numDeq` slots; payload is unspecified beyond occupancy. */
   protected final val deqData: Seq[T] = (0 until numDeq).map { offset =>
@@ -130,7 +107,7 @@ abstract class RingQueue[T <: Data](
     */
   protected def accept(elements: Seq[ValidIO[T]]): Seq[Bool] = {
     val canAccept = (count +& PopCount(elements.map(_.valid))) <= entries.U
-    elements.map(element => element.valid && canAccept && !recoverWire && !flushWire)
+    elements.map(element => element.valid && canAccept && !recover && !flush)
   }
 
   /** Register Valid inputs and return their actual acceptance for this cycle.
@@ -163,50 +140,27 @@ abstract class RingQueue[T <: Data](
 
   private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Seq[Bool] = {
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
-    when(!recoverWire && !flushWire && VecInit(accepted).asUInt.orR) {
+    when(!recover && !flush && VecInit(accepted).asUInt.orR) {
       enqPtr := enqPtr + PopCount(accepted)
     }
     for (i <- elements.indices) {
       // Share each port's destination calculation across all physical slots.
       val destination = (enqPtr + PopCount(accepted.take(i))).value
       update { entry =>
-        when(!recoverWire && !flushWire && accepted(i) && destination === physicalSlot(entry).U) {
+        when(!recover && !flush && accepted(i) && destination === physicalSlot(entry).U) {
           entry := elements(i)
         }
       }
     }
-    accepted.map(_ && !recoverWire && !flushWire)
+    accepted.map(_ && !recover && !flush)
   }
 
   /** Consume the oldest `count` entries by advancing the head.
     * The caller must keep count within current occupancy.
     */
   protected def deq(count: UInt): Unit = {
-    when(!flushWire) {
+    when(!flush) {
       deqPtr := deqPtr + count
     }
   }
-
-  /** Restore the tail to discard newer entries, suppressing enqueue.
-    * The target must lie between the surviving head and old tail.
-    * Dequeue still proceeds during recovery.
-    */
-  protected def recover(target: QueuePtr, enable: Bool): Unit = {
-    recoverWire := enable
-    when(enable && !flushWire) {
-      enqPtr := target
-    }
-  }
-
-  /** Empty the queue at the next edge, overriding other pointer updates.
-    * Current-cycle reads still see the old state.
-    */
-  protected def flush(enable: Bool): Unit = {
-    flushWire := enable
-    when(enable) {
-      enqPtr := 0.U.asTypeOf(new QueuePtr)
-      deqPtr := 0.U.asTypeOf(new QueuePtr)
-    }
-  }
-
 }
