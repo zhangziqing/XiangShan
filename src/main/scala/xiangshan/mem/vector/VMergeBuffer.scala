@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import freechips.rocketchip.diplomacy.BufferParams
 import utils._
+import utils.QueueModel.{IndexFreeList, QueueRTL}
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -68,7 +69,7 @@ abstract class BaseVMergeBuffer(isVStore: Boolean=false)(implicit p: Parameters)
   // +---+---+--------------+-----+-----+
   // | 0 | 1 |      ......  | n-2 | n-1 |
   // +---+---+--------------+-----+-----+
-  val freeList: FreeList
+  val freeList: IndexFreeList
   val uopSize: Int
   val enqWidth = io.fromSplit.length
   val deqWidth = io.uopWriteback.length
@@ -422,13 +423,13 @@ abstract class BaseVMergeBuffer(isVStore: Boolean=false)(implicit p: Parameters)
 class VLMergeBufferImp(implicit p: Parameters) extends BaseVMergeBuffer(isVStore=false){
   override lazy val uopSize = VlMergeBufferSize
   println(s"VLMergeBuffer Size: ${VlMergeBufferSize}")
-  override lazy val freeList = Module(new FreeList(
-    size = uopSize,
+  override lazy val freeList = Module(new IndexFreeList(
+    entries = uopSize,
     allocWidth = VecLoadPipelineWidth,
     freeWidth = deqWidth,
     enablePreAlloc = false,
     moduleName = "VLoad MergeBuffer freelist"
-  ))
+  )(p, QueueRTL))
   io.toSplit.threshold := freeCount <= 6.U
 
   //merge data
@@ -499,13 +500,13 @@ class VLMergeBufferImp(implicit p: Parameters) extends BaseVMergeBuffer(isVStore
 class VSMergeBufferImp(implicit p: Parameters) extends BaseVMergeBuffer(isVStore=true){
   override lazy val uopSize = VsMergeBufferSize
   println(s"VSMergeBuffer Size: ${VsMergeBufferSize}")
-  override lazy val freeList = Module(new FreeList(
-    size = uopSize,
+  override lazy val freeList = Module(new IndexFreeList(
+    entries = uopSize,
     allocWidth = VecStorePipelineWidth,
     freeWidth = deqWidth,
     enablePreAlloc = false,
     moduleName = "VStore MergeBuffer freelist"
-  ))
+  )(p, QueueRTL))
   override def DeqConnect(source: MBufferBundle): MemExuOutput = {
     val sink               = Wire(new MemExuOutput(isVector = true))
     sink.data             := DontCare
