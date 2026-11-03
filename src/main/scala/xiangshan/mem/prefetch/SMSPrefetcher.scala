@@ -29,6 +29,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.{OverrideableQueue => ModelOverrideableQueue, QueueRTL}
 import utility._
 import xiangshan._
 import xiangshan.backend.fu.PMPRespBundle
@@ -614,11 +615,11 @@ class PatternHistoryTable()(implicit p: Parameters) extends XSModule with HasSMS
 
   val replacement = Seq.fill(PHT_SETS) { ReplacementPolicy.fromString("plru", smsParams.pht_ways) }
 
-  val lookup_queue = Module(new OverrideableQueue(new PhtLookup, smsParams.pht_lookup_queue_size))
+  val lookup_queue = Module(new ModelOverrideableQueue(new PhtLookup, smsParams.pht_lookup_queue_size)(p, QueueRTL).emitRTL())
   lookup_queue.io.in := io.s2_agt_lookup
   val lookup = lookup_queue.io.out
 
-  val evict_queue = Module(new OverrideableQueue(new AGTEntry, smsParams.pht_lookup_queue_size))
+  val evict_queue = Module(new ModelOverrideableQueue(new AGTEntry, smsParams.pht_lookup_queue_size)(p, QueueRTL).emitRTL())
   evict_queue.io.in := io.agt_update
   val evict = evict_queue.io.out
 
