@@ -6,9 +6,7 @@ import chisel3.Data._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
-/** Ring storage with circular pointer stepping and dense FIFO admission by default.
-  * Pointer-derived status requires live entries in `[deqPtr, enqPtr)`; subclasses
-  * with independent positions must supply their own admission and validity rules.
+/** FIFO storage with live entries in `[deqPtr, enqPtr)`.
   * Subclasses define IO and register updates before calling `emitRTL`.
   */
 abstract class RingQueue[T <: Data](
