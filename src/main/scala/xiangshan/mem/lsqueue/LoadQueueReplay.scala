@@ -19,6 +19,7 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.{IndexFreeList, QueueRTL}
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -247,13 +248,13 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   // +---+---+--------------+-----+-----+
   // | 0 | 1 |      ......  | n-2 | n-1 |
   // +---+---+--------------+-----+-----+
-  val freeList = Module(new FreeList(
-    size = LoadQueueReplaySize,
+  val freeList = Module(new IndexFreeList(
+    entries = LoadQueueReplaySize,
     allocWidth = LoadPipelineWidth,
     freeWidth = 4,
     enablePreAlloc = true,
     moduleName = "LoadQueueReplay freelist"
-  ))
+  )(p, QueueRTL))
   freeList.io := DontCare
   /**
    * used for re-select control
