@@ -55,10 +55,10 @@ abstract class RingQueue[T <: Data](
     result
   }
 
-  private def emitElementUpdates(): Unit = {
+  private def emitUpdates(): Unit = {
     require(!emitted, "element updates must be emitted exactly once")
     emitted = true
-    foreach(modifyElement)
+    contents.foreach(modifyElement)
   }
 
   /** Find a callback entry's slot index while generating the circuit. */
@@ -87,12 +87,6 @@ abstract class RingQueue[T <: Data](
 
   private var enqCallback: () => Unit = () => ()
 
-  /** Read the oldest `numDeq` slots; payload is unspecified beyond occupancy. */
-  protected final val deqData: Seq[T] = (0 until numDeq).map { offset =>
-    val index = (deqPtr + offset.U).value
-    read(index)
-  }
-
   /** Emit registered updates once, with enqueue writes taking priority.
     * Call after the subclass has registered its updates and transfers.
     *
@@ -101,7 +95,7 @@ abstract class RingQueue[T <: Data](
     */
   final def emitRTL(): this.type = {
     enqCallback()
-    emitElementUpdates()
+    emitUpdates()
     this
   }
 
@@ -151,11 +145,19 @@ abstract class RingQueue[T <: Data](
     }
   }
 
-  /** Consume the oldest `count` entries by advancing the head.
-    * The caller must keep count within current occupancy.
+  /** Read current head-relative candidates and consume `count` entries.
+    * Reads remain visible when count is zero; payload beyond occupancy is
+    * unspecified. The caller must keep count within current occupancy.
     */
-  protected def deq(count: UInt): Unit = {
-    when(!flush) {
+  protected def deq(count: UInt, offsets: Seq[UInt] = (0 until numDeq).map(_.U)): Seq[T] = {
+    require(offsets.nonEmpty && offsets.length <= numDeq, "dequeue exceeds the configured read window")
+    advanceDeq(count)
+    offsets.map(offset => read((deqPtr + offset).value))
+  }
+
+  /** Advance consumption without reading, for callers with separate previews. */
+  protected final def advanceDeq(count: UInt): Unit = {
+    when(!flush && count.orR) {
       deqPtr := deqPtr + count
     }
   }
