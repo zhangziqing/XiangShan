@@ -90,7 +90,8 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqCallback: () => Unit = () => ()
+  private case class EnqueueBatch(elements: Seq[T], accepted: Seq[Bool])
+  private var enqueueBatch: Option[EnqueueBatch] = None
 
   /** Emit registered updates once, with enqueue writes taking priority.
     * Call after the subclass has registered its updates and transfers.
@@ -99,8 +100,8 @@ abstract class RingQueue[T <: Data](
     * `Module(new SomeQueue(...).emitRTL())`.
     */
   final def emitRTL(): this.type = {
-    enqCallback()
     emitUpdates()
+    emitEnqueue()
     this
   }
 
@@ -133,20 +134,30 @@ abstract class RingQueue[T <: Data](
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqCallback = () => enqImpl(elements, accepted)
+    enqueueBatch = Some(EnqueueBatch(elements, accepted))
   }
 
-  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Unit = {
-    when(!recover && !flush && VecInit(accepted).asUInt.orR) {
-      enqPtr := advancePtr(enqPtr, PopCount(accepted))
-    }
-    for (i <- elements.indices) {
-      // Share each port's destination calculation across all physical slots.
-      val destination = advancePtr(enqPtr, PopCount(accepted.take(i))).value
-      update { entry =>
-        when(!recover && !flush && accepted(i) && destination === physicalSlot(entry).U) {
-          entry := elements(i)
+  /** Emit the retained batch after ordinary updates so enqueue writes win. */
+  private def emitEnqueue(): Unit = {
+    enqueueBatch.foreach { batch =>
+      // Decode each accepted input once; unused binary destinations decode to zero.
+      val destinationOH = batch.elements.indices.map { i =>
+        val destination = advancePtr(enqPtr, PopCount(batch.accepted.take(i))).value
+        val inRange = destination < entries.U
+        Mux(batch.accepted(i) && inRange, UIntToOH(destination, entries), 0.U(entries.W))
+      }
+      // One shared per-slot enable; one physical write per slot. Legal callers
+      // provide unique destinations, so each select is one-hot; the priority
+      // mux keeps the legacy later-port dominance for an aliasing batch.
+      val writeEnable = destinationOH.reduce(_ | _)
+      for (slot <- 0 until entries) {
+        val selects = destinationOH.map(_(slot))
+        when(!recover && !flush && writeEnable(slot)) {
+          contents(slot) := PriorityMux(selects.zip(batch.elements).reverse)
         }
+      }
+      when(!recover && !flush && VecInit(batch.accepted).asUInt.orR) {
+        enqPtr := advancePtr(enqPtr, PopCount(batch.accepted))
       }
     }
   }
