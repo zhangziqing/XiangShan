@@ -6,7 +6,9 @@ import chisel3.Data._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
-/** FIFO storage with live entries in `[deqPtr, enqPtr)`.
+/** Ring storage with circular pointer stepping and dense FIFO admission by default.
+  * Pointer-derived status requires live entries in `[deqPtr, enqPtr)`; subclasses
+  * with independent positions must supply their own admission and validity rules.
   * Subclasses define IO and register updates before calling `emitRTL`.
   */
 abstract class RingQueue[T <: Data](
@@ -36,12 +38,15 @@ abstract class RingQueue[T <: Data](
 
   /** Read current storage without exposing an assignment destination. */
   protected final def read(index: Int): T = contents(index).readOnly
-  protected final def read(index: UInt): T = contents(index).readOnly
+  protected def read(index: UInt): T = contents(index).readOnly
+
+  /** Compute a transfer position; the default wraps at capacity with a phase bit. */
+  protected def advancePtr(ptr: QueuePtr, count: UInt): QueuePtr = ptr + count
 
   protected final def compose(first: T => Unit, second: T => Unit): T => Unit =
     entry => { first(entry); second(entry) }
 
-  override protected final def foreach(read: T => Unit): Unit = contents.foreach(read)
+  override protected def foreach(read: T => Unit): Unit = contents.foreach(read)
 
   /** Put Chisel conditions inside the callback; it runs later in `emitRTL`. */
   override protected final def update(modify: T => Unit): Unit = {
@@ -124,6 +129,7 @@ abstract class RingQueue[T <: Data](
     * both the writes and tail advance.
     */
   protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+    require(!emitted, "enqueue must be registered before emission")
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
@@ -132,11 +138,11 @@ abstract class RingQueue[T <: Data](
 
   private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Unit = {
     when(!recover && !flush && VecInit(accepted).asUInt.orR) {
-      enqPtr := enqPtr + PopCount(accepted)
+      enqPtr := advancePtr(enqPtr, PopCount(accepted))
     }
     for (i <- elements.indices) {
       // Share each port's destination calculation across all physical slots.
-      val destination = (enqPtr + PopCount(accepted.take(i))).value
+      val destination = advancePtr(enqPtr, PopCount(accepted.take(i))).value
       update { entry =>
         when(!recover && !flush && accepted(i) && destination === physicalSlot(entry).U) {
           entry := elements(i)
@@ -152,13 +158,13 @@ abstract class RingQueue[T <: Data](
   protected def deq(count: UInt, offsets: Seq[UInt] = (0 until numDeq).map(_.U)): Seq[T] = {
     require(offsets.nonEmpty && offsets.length <= numDeq, "dequeue exceeds the configured read window")
     advanceDeq(count)
-    offsets.map(offset => read((deqPtr + offset).value))
+    offsets.map(offset => read(advancePtr(deqPtr, offset).value))
   }
 
   /** Advance consumption without reading, for callers with separate previews. */
   protected final def advanceDeq(count: UInt): Unit = {
     when(!flush && count.orR) {
-      deqPtr := deqPtr + count
+      deqPtr := advancePtr(deqPtr, count)
     }
   }
 }
