@@ -124,28 +124,36 @@ private[QueueModel] class IndexFreeListRing(
     val nextFreeCount = Output(UInt(log2Ceil(entries + 1).W))
   })
 
-  private val headPtrNext = deqPtr + PopCount(io.doAllocate)
+  private val allocatedCount = PopCount(io.doAllocate)
+  private val headPtrNext = deqPtr + allocatedCount
   private val tailPtrNext = enqPtr + PopCount(io.enqueueValid)
-  when(io.doAllocate.asUInt.orR) { deq(PopCount(io.doAllocate)) }
   // Use the explicit mask so selected returns are never dropped by admission.
   enq(io.enqueueIndex.toSeq, io.enqueueValid.toSeq)
   emitRTL()
 
+  private val offsets = (0 until allocWidth).map(i => PopCount(io.allocateReq.take(i)))
+  private val payloads = if (enablePreAlloc) {
+    advanceDeq(allocatedCount)
+    offsets.map { offset =>
+      // Keep both pointer steps to preserve non-power-of-two wrap behavior.
+      val candidate = headPtrNext + offset
+      RegEnable(read(candidate.value), true.B)
+    }
+  } else {
+    deq(allocatedCount, offsets)
+  }
   for (i <- 0 until allocWidth) {
     // Preallocation previews from the head after this cycle's allocations.
     val base = if (enablePreAlloc) headPtrNext else deqPtr
-    // Keep pointer steps separate to preserve non-power-of-two wrap behavior.
-    val candidate = base + PopCount(io.allocateReq.take(i))
+    val candidate = base + offsets(i)
     val available = isBefore(candidate, enqPtr)
-    val payload = read(candidate.value)
     if (enablePreAlloc) {
       // Register next-cycle candidates; outputs have no reset value.
       io.canAllocate(i) := RegEnable(available, true.B)
-      io.allocateSlot(i) := RegEnable(payload, true.B)
     } else {
       io.canAllocate(i) := available
-      io.allocateSlot(i) := payload
     }
+    io.allocateSlot(i) := payloads(i)
   }
   io.nextFreeCount := distanceBetween(tailPtrNext, headPtrNext)
 }
