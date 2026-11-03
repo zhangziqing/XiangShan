@@ -19,10 +19,8 @@ abstract class QueueBase[T <: Data](val entries: Int)(
   /** Use the wrap phase to distinguish full from empty at the same index.
     * A single-slot queue needs only the phase bit.
     */
-  protected def pointerIndexWidth: Int = log2Ceil(entries)
-
   protected class QueuePtr extends CircularQueuePtr[QueuePtr](QueueBase.this.entries) {
-    override val value = UInt(pointerIndexWidth.W)
+    override val value = UInt(log2Ceil(QueueBase.this.entries).W)
   }
 
   protected def enqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
