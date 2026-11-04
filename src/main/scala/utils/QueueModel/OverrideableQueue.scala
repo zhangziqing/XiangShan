@@ -2,7 +2,6 @@
 package utils.QueueModel
 
 import chisel3._
-import chisel3.Data._
 import chisel3.experimental.BundleLiterals._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
@@ -31,19 +30,15 @@ class OverrideableQueue[T <: Data](gen: T, entries: Int)(
   override protected def initContents: Option[Seq[ValidIO[T]]] =
     Some(Seq.fill(entries)(Valid(gen).Lit(_.valid -> false.B)))
 
-  /** Select the current physical head using the original one-hot read circuit. */
-  private def readHead: ValidIO[T] =
-    Mux1H((0 until entries).map(slot => deqPtr.value === slot.U), (0 until entries).map(read)).readOnly
-
   /** Register the final Valid input; admission is independent of the reader. */
   protected def enq(element: ValidIO[T]): Bool = {
     super.enq(Seq(element), Seq(element.valid))
     element.valid
   }
 
-  /** Read the current slot and consume it when valid and ready. */
+  /** Consume only a valid head; pointer distance is not overwrite occupancy. */
   protected def deq(ready: Bool): ValidIO[T] = {
-    val head = readHead
+    val head = read(deqPtr.value)
     val consume = head.valid && ready
     advanceDeq(consume.asUInt)
     update { entry =>
