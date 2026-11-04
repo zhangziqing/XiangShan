@@ -37,6 +37,13 @@ abstract class QueueBase[T <: Data](val entries: Int)(
     */
   protected def update(modify: T => Unit): Unit
 
+  /** Register elements and acceptance for later enqueue emission. Accepted
+    * elements occupy successive positions from the old tail in input order;
+    * their population count determines the tail advance. A later registration
+    * replaces the earlier definition. Admission belongs to the concrete owner.
+    */
+  protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit
+
   /** Test all physical slots; include any validity check in the predicate. */
   protected def exists(predicate: T => Bool): Bool
 }
