@@ -141,4 +141,3 @@ class DatamoduleResultBuffer[T <: Data]
     }
   }
 }
-
