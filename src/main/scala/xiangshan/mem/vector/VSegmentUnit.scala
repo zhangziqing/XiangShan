@@ -78,18 +78,6 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
 
   val maxSize          = VSegmentBufferSize
 
-  class VSegUPtr(implicit p: Parameters) extends CircularQueuePtr[VSegUPtr](maxSize){
-  }
-
-  object VSegUPtr {
-    def apply(f: Bool, v: UInt)(implicit p: Parameters): VSegUPtr = {
-      val ptr           = Wire(new VSegUPtr)
-      ptr.flag         := f
-      ptr.value        := v
-      ptr
-    }
-  }
-
   val maxSplitNum = 2
 
   /**
@@ -165,20 +153,21 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   // buffer uop
   val instMicroOp       = Reg(new VSegmentBundle)
   val instMicroOpValid  = RegInit(false.B)
-  val data              = Reg(Vec(maxSize, UInt(VLEN.W)))
-  val uopq              = Reg(Vec(maxSize, new VSegmentUop))
-  val stride            = Reg(Vec(maxSize, UInt(VLEN.W)))
-  val allocated         = RegInit(VecInit(Seq.fill(maxSize)(false.B)))
-  val enqPtr            = RegInit(0.U.asTypeOf(new VSegUPtr))
-  val deqPtr            = RegInit(0.U.asTypeOf(new VSegUPtr))
-  val stridePtr         = WireInit(0.U.asTypeOf(new VSegUPtr)) // for select stride/index
-  val stridePtrReg      = RegInit(0.U.asTypeOf(new VSegUPtr)) // for select stride/index
+  // The segment transaction payload (uop + loaded data + stride/index) and its
+  // cursor state belong to the retained-transaction queue. `empty` replaces
+  // the legacy pointer-equality test, and the payload array is deliberately left
+  // uninitialised, exactly like the legacy `Reg(Vec(...))` arrays.
+  val segQueue = Module(new SegmentRing(maxSize, 3))
+  val enqPtr   = segQueue.io.enqPtr
+  val deqPtr   = segQueue.io.deqPtr
+  val stridePtr         = Wire(new SegmentRingPtr(maxSize)) // for select stride/index
+  val stridePtrReg      = RegInit(0.U.asTypeOf(new SegmentRingPtr(maxSize))) // for select stride/index
 
   val segmentIdx        = RegInit(0.U(elemIdxBits.W))
   val fieldIdx          = RegInit(0.U(fieldBits.W))
   val segmentOffset     = RegInit(0.U(XLEN.W))
-  val splitPtr          = RegInit(0.U.asTypeOf(new VSegUPtr)) // for select load/store data
-  val splitPtrNext      = WireInit(0.U.asTypeOf(new VSegUPtr))
+  val splitPtr          = RegInit(0.U.asTypeOf(new SegmentRingPtr(maxSize))) // for select load/store data
+  val splitPtrNext      = Wire(new SegmentRingPtr(maxSize))
 
   val exception_va      = WireInit(false.B)
   val exception_gpa     = WireInit(false.B)
@@ -401,24 +390,22 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
     isMisalignReg                     := false.B
     notCross16ByteReg                 := false.B
   }
-  // latch data
-  when(io.in.fire && !isEnqFixVlUop){
-    data(enqPtr.value)                := io.in.bits.src_vs3
-    stride(enqPtr.value)              := io.in.bits.src_stride
-    uopq(enqPtr.value).uop            := io.in.bits.uop
-  }
-
-  // update enqptr, only 1 port
-  when(io.in.fire && !isEnqFixVlUop){
-    enqPtr                            := enqPtr + 1.U
-  }
+  // Enqueue one retained segment transaction. The input is unconditionally
+  // accepted (io.in.ready := true.B below); the ring never back-pressures, so
+  // external capacity discipline must keep the ring from wrapping. The ring
+  // owns the cursor advance.
+  segQueue.io.enq.valid       := io.in.fire && !isEnqFixVlUop
+  segQueue.io.enq.bits.uop    := io.in.bits.uop
+  segQueue.io.enq.bits.data   := io.in.bits.src_vs3
+  segQueue.io.enq.bits.stride := io.in.bits.src_stride
 
   /*************************************************************************
    *                            output logic
    *************************************************************************/
 
+  segQueue.io.read(1).addr            := stridePtrReg.value
   val indexStride                     = IndexAddr( // index for indexed instruction
-                                                    index = stride(stridePtrReg.value),
+                                                    index = segQueue.io.read(1).data.stride,
                                                     flow_inner_idx = issueIndexIdx,
                                                     eew = issueEew
                                                   )
@@ -663,23 +650,27 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   val shiftData    = (io.rdcache.resp.bits.data_delayed >> (latchVaddr(3, 0) << 3)).asUInt(63, 0)
   val mergemisalignData = Mux(notCross16ByteReg, shiftData, combinedData)
   val pickData  = rdataVecHelper(alignedType(1,0), Mux(isMisalignReg, mergemisalignData, cacheData))
+  segQueue.io.read(0).addr := splitPtr.value
   val mergedData = mergeDataWithElemIdx(
-    oldData = data(splitPtr.value),
+    oldData = segQueue.io.read(0).data.data,
     newData = Seq(pickData),
     alignedType = alignedType(1,0),
     elemIdx = Seq(elemIdxInVd),
     valids = Seq(true.B)
   )
-  when(state === s_latch_and_merge_data && segmentActive){
-    data(splitPtr.value) := mergedData
-  }
+  // Bounded data-only merge at the split cursor. `SegmentRing` applies the
+  // merge after the enqueue, so on a same-slot collision the incoming
+  // `uop`/`stride` survive and only `data` is replaced.
+  segQueue.io.merge.valid     := state === s_latch_and_merge_data && segmentActive
+  segQueue.io.merge.bits.addr := splitPtr.value
+  segQueue.io.merge.bits.data := mergedData
 
 
   /**
    * split data for store
    * */
   val splitData = genVSData(
-    data = data(splitPtr.value),
+    data = segQueue.io.read(0).data.data,
     elemIdx = elemIdxInVd,
     alignedType = alignedType
   )
@@ -775,7 +766,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   )
 
   io.vecDifftestInfo.valid         := io.sbuffer.valid
-  io.vecDifftestInfo.bits.uop      := uopq(deqPtr.value).uop
+  io.vecDifftestInfo.bits.uop      := segQueue.io.deq.bits.uop
   io.vecDifftestInfo.bits.start    := 0.U // only use in no-segment unit-stride
   io.vecDifftestInfo.bits.offset   := 0.U
 
@@ -861,17 +852,17 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
 
   //update segmentOffset
   /* when segment is active or segment is inactive, increase segmentOffset */
+  segQueue.io.read(2).addr := stridePtr.value
   when((fieldIdx === maxNfields && (state === s_latch_and_merge_data || (state === s_send_data && stateNext =/= s_send_data && fieldActiveWirteFinish))) ||
        segmentInactiveFinish){
 
-    segmentOffset := segmentOffset + Mux(isUnitStride(issueInstType), (maxNfields +& 1.U) << issueEew(1, 0), stride(stridePtr.value))
+    segmentOffset := segmentOffset + Mux(isUnitStride(issueInstType), (maxNfields +& 1.U) << issueEew(1, 0), segQueue.io.read(2).data.stride)
   }
 
 
-  //update deqPtr
-  when((state === s_finish) && !isEmpty(enqPtr, deqPtr)){
-    deqPtr := deqPtr + 1.U
-  }
+  // Retire the head transaction. The ring owns the dequeue cursor; the
+  // combinational head payload is available on `segQueue.io.deq.bits`.
+  segQueue.io.deq.ready := (state === s_finish) && !segQueue.io.empty
 
 
   /*************************************************************************
@@ -892,7 +883,8 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   /*************************************************************************
    *                            dequeue logic
    *************************************************************************/
-  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), uopq(deqPtr.value).uop.vpu.vuopIdx)
+  val segDeq = segQueue.io.deq.bits
+  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), segDeq.uop.vpu.vuopIdx)
   /*select mask of vd, maybe remove in feature*/
   val realEw        = Mux(isIndexed(issueInstType), issueSew(1, 0), issueEew(1, 0))
   val maskDataVec: Vec[UInt] = VecDataToMaskDataVec(instMicroOp.mask, realEw)
@@ -903,7 +895,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   }
   // writeback to backend
   val writebackOut                     = WireInit(io.uopwriteback.bits)
-  val writebackValid                   = (state === s_finish) && !isEmpty(enqPtr, deqPtr) || fofFixVlValid
+  val writebackValid                   = (state === s_finish) && !segQueue.io.empty || fofFixVlValid
 
   when(fofFixVlValid) {
     writebackOut.uop                    := fofBuffer
@@ -912,17 +904,17 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
     writebackOut.mask.get               := Fill(VLEN, 1.U)
     writebackOut.uop.vpu.vmask          := Fill(VLEN, 1.U)
   }.otherwise{
-    writebackOut.uop                    := uopq(deqPtr.value).uop
+    writebackOut.uop                    := segDeq.uop
     writebackOut.uop.vpu                := instMicroOp.uop.vpu
     writebackOut.uop.trigger            := instMicroOp.uop.trigger
     writebackOut.uop.exceptionVec       := instMicroOp.uop.exceptionVec
     writebackOut.mask.get               := instMicroOp.mask
-    writebackOut.data                   := data(deqPtr.value)
+    writebackOut.data                   := segDeq.data
     writebackOut.vdIdx.get              := vdIdxInField
     writebackOut.uop.vpu.vl             := instMicroOp.vl
     writebackOut.uop.vpu.vstart         := Mux(instMicroOp.uop.exceptionVec.asUInt.orR || TriggerAction.isDmode(instMicroOp.uop.trigger), instMicroOp.exceptionVstart, instMicroOp.vstart)
     writebackOut.uop.vpu.vmask          := maskUsed
-    writebackOut.uop.vpu.vuopIdx        := uopq(deqPtr.value).uop.vpu.vuopIdx
+    writebackOut.uop.vpu.vuopIdx        := segDeq.uop.vpu.vuopIdx
     writebackOut.debug                  := DontCare
     writebackOut.vdIdxInField.get       := vdIdxInField
     writebackOut.uop.robIdx             := instMicroOp.uop.robIdx
@@ -936,14 +928,14 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
 
   //to RS
   val feedbackOut                      = WireInit(0.U.asTypeOf(io.feedback.bits))
-  val feedbackValid                    = state === s_finish && !isEmpty(enqPtr, deqPtr)
+  val feedbackValid                    = state === s_finish && !segQueue.io.empty
   feedbackOut.hit                     := true.B
   feedbackOut.robIdx                  := instMicroOp.uop.robIdx
   feedbackOut.sourceType              := DontCare
   feedbackOut.flushState              := DontCare
   feedbackOut.dataInvalidSqIdx        := DontCare
-  feedbackOut.sqIdx                   := uopq(deqPtr.value).uop.sqIdx
-  feedbackOut.lqIdx                   := uopq(deqPtr.value).uop.lqIdx
+  feedbackOut.sqIdx                   := segDeq.uop.sqIdx
+  feedbackOut.lqIdx                   := segDeq.uop.lqIdx
 
   io.feedback.valid                   := RegNext(feedbackValid)
   io.feedback.bits                    := RegEnable(feedbackOut, feedbackValid)
@@ -953,12 +945,11 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   // exception
   io.exceptionInfo                    := DontCare
   io.exceptionInfo.bits.robidx        := instMicroOp.uop.robIdx
-  io.exceptionInfo.bits.uopidx        := uopq(deqPtr.value).uop.vpu.vuopIdx
+  io.exceptionInfo.bits.uopidx        := segDeq.uop.vpu.vuopIdx
   io.exceptionInfo.bits.vstart        := instMicroOp.exceptionVstart
   io.exceptionInfo.bits.vaddr         := instMicroOp.exceptionVaddr
   io.exceptionInfo.bits.gpaddr        := instMicroOp.exceptionGpaddr
   io.exceptionInfo.bits.isForVSnonLeafPTE := instMicroOp.exceptionIsForVSnonLeafPTE
   io.exceptionInfo.bits.vl            := instMicroOp.exceptionVl.bits
-  io.exceptionInfo.valid              := (state === s_finish) && instMicroOp.uop.exceptionVec.asUInt.orR && !isEmpty(enqPtr, deqPtr)
+  io.exceptionInfo.valid              := (state === s_finish) && instMicroOp.uop.exceptionVec.asUInt.orR && !segQueue.io.empty
 }
-
