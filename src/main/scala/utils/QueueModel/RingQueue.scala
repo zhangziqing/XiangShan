@@ -85,17 +85,21 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqCallback: () => Unit = () => ()
+  private var enqDefinition: Option[(Seq[T], Seq[Bool])] = None
 
-  /** Emit registered updates once, with enqueue writes taking priority.
-    * Call after the subclass has registered its updates and transfers.
+  /** Emit registered updates first, so the later enqueue writes retain
+    * payload priority. Call after the subclass has registered its updates and
+    * transfers. An enqueue definition is required before any updates are emitted.
     *
     * Keep emission inside Module construction, e.g.
     * `Module(new SomeQueue(...).emitRTL())`.
     */
   final def emitRTL(): this.type = {
-    enqCallback()
+    val (elements, accepted) = enqDefinition.getOrElse {
+      throw new IllegalArgumentException("enqueue must be registered before emission")
+    }
     emitUpdates()
+    emitEnq(elements, accepted)
     this
   }
 
@@ -119,30 +123,33 @@ abstract class RingQueue[T <: Data](
 
   /** Place accepted ports in order at the writer. Callers own membership and
     * replacement policy; dense FIFO callers must respect available capacity.
-    * Only the last `enq` call takes effect, even if every acceptance bit is false.
+    * Each accepted port writes at its accepted-prefix rank from the old tail,
+    * and the tail advances by the accepted population count. Only the last call
+    * takes effect, even if every acceptance bit is false.
     *
-    * Enqueue writes override element updates. Flush or recovery suppresses
-    * both the writes and tail advance.
+    * Enqueue writes override element updates. Flush or recovery guards both
+    * the emitted writes and the tail advance.
     */
-  protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+  override protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
     require(!emitted, "enqueue must be registered before emission")
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqCallback = () => enqImpl(elements, accepted)
+    enqDefinition = Some((elements, accepted))
   }
 
-  private def enqImpl(elements: Seq[T], accepted: Seq[Bool]): Unit = {
-    when(!recover && !flush && VecInit(accepted).asUInt.orR) {
-      enqPtr := enqPtr + PopCount(accepted)
-    }
-    for (i <- elements.indices) {
-      // Share each port's destination calculation across all physical slots.
-      val destination = (enqPtr + PopCount(accepted.take(i))).value
-      update { entry =>
-        when(!recover && !flush && accepted(i) && destination === physicalSlot(entry).U) {
-          entry := elements(i)
+  /** Lower the registered enqueue definition after ordinary updates. */
+  private def emitEnq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+    when(!recover && !flush) {
+      for (i <- elements.indices) {
+        when(accepted(i)) {
+          val offset = PopCount(accepted.take(i))
+          contents((enqPtr + offset).value) := elements(i)
         }
+      }
+      val enqCount = PopCount(accepted)
+      when(enqCount.orR) {
+        enqPtr := enqPtr + enqCount
       }
     }
   }
