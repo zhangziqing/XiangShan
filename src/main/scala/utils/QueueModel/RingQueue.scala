@@ -85,18 +85,21 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqueue: Option[(Seq[T], Seq[Bool])] = None
+  private var enqDefinition: Option[(Seq[T], Seq[Bool])] = None
 
   /** Emit registered updates first, so the later enqueue writes retain
     * payload priority. Call after the subclass has registered its updates and
-    * transfers.
+    * transfers. An enqueue definition is required before any updates are emitted.
     *
     * Keep emission inside Module construction, e.g.
     * `Module(new SomeQueue(...).emitRTL())`.
     */
   final def emitRTL(): this.type = {
+    val (elements, accepted) = enqDefinition.getOrElse {
+      throw new IllegalArgumentException("enqueue must be registered before emission")
+    }
     emitUpdates()
-    emitEnqueueRTL()
+    emitEnq(elements, accepted)
     this
   }
 
@@ -132,23 +135,21 @@ abstract class RingQueue[T <: Data](
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqueue = Some((elements, accepted))
+    enqDefinition = Some((elements, accepted))
   }
 
-  /** Lower the retained enqueue definition only at the RTL emission boundary. */
-  private def emitEnqueueRTL(): Unit = {
-    enqueue.foreach { case (elements, accepted) =>
-      when(!recover && !flush) {
-        for (i <- elements.indices) {
-          when(accepted(i)) {
-            val offset = PopCount(accepted.take(i))
-            contents((enqPtr + offset).value) := elements(i)
-          }
+  /** Lower the registered enqueue definition after ordinary updates. */
+  private def emitEnq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+    when(!recover && !flush) {
+      for (i <- elements.indices) {
+        when(accepted(i)) {
+          val offset = PopCount(accepted.take(i))
+          contents((enqPtr + offset).value) := elements(i)
         }
-        val step = PopCount(accepted)
-        when(step.orR) {
-          enqPtr := enqPtr + step
-        }
+      }
+      val enqCount = PopCount(accepted)
+      when(enqCount.orR) {
+        enqPtr := enqPtr + enqCount
       }
     }
   }
