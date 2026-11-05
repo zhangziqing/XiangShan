@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import xiangshan._
 import utils._
+import _root_.utils.QueueModel.SparseLaneRingQueue
 import utility._
 import xiangshan.cache._
 
@@ -203,8 +204,8 @@ class StorePrefetchBursts(implicit p: Parameters) extends DCacheModule with HasS
 
 // L2 Store prefetch component
 
-// Serializer: FIFO queue, recieve EnsbufferWidth requests sent from sq to sbuffer
-//             save them to a FIFO queue, pop them in order
+// Serializer: fixed-lane ring, receives EnsbufferWidth requests from sq to sbuffer
+//             lane i writes tail+i, so holes and overwritten slots are preserved
 class Serializer(implicit p: Parameters) extends DCacheModule with HasStorePrefetchHelper {
   val io = IO(new DCacheBundle {
     val sbuffer_enq  = Vec(EnsbufferWidth, Flipped(Valid(new DCacheWordReqWithVaddr)))
@@ -212,49 +213,18 @@ class Serializer(implicit p: Parameters) extends DCacheModule with HasStorePrefe
   })
   val QueueSize = SERIALIZER_SIZE
 
-  class SerializerPtr(implicit p: Parameters) extends CircularQueuePtr[SerializerPtr](p => QueueSize){}
+  private val queue = Module(new SparseLaneRingQueue(
+    new DCacheWordReqWithVaddr, QueueSize, EnsbufferWidth))
 
-  object SerializerPtr {
-    def apply(f: Bool, v: UInt)(implicit p: Parameters): SerializerPtr = {
-      val ptr = Wire(new SerializerPtr)
-      ptr.flag := f
-      ptr.value := v
-      ptr
-    }
+  for (i <- 0 until EnsbufferWidth) {
+    queue.io.enq(i).valid := io.sbuffer_enq(i).valid
+    queue.io.enq(i).bits := io.sbuffer_enq(i).bits
   }
+  io.prefetch_train <> queue.io.deq
 
-  val enqPtrExt = RegInit(VecInit((0 until EnsbufferWidth).map(_.U.asTypeOf(new SerializerPtr))))
-  val deqPtrExt = RegInit(0.U.asTypeOf(new SerializerPtr))
-
-  val deqPtr = deqPtrExt.value
-
-  val reqs = RegInit(VecInit((0 until QueueSize).map(_.U.asTypeOf(Valid(new DCacheWordReqWithVaddr)))))
-
-  // deq
-  io.prefetch_train.valid := reqs(deqPtr).valid
-  io.prefetch_train.bits  := reqs(deqPtr).bits
-
-  when(io.prefetch_train.fire) {
-    deqPtrExt := deqPtrExt + 1.U
-    reqs(deqPtr).valid := false.B
-  }
-
-  // enq
-  val count_vsreq = PopCount(io.sbuffer_enq.map(_.valid))
-  val canEnqueue = (distanceBetween(enqPtrExt(0), deqPtrExt) + count_vsreq) <= QueueSize.U
-
-  when(canEnqueue) {
-    for(i <- 0 until EnsbufferWidth) {
-      when(io.sbuffer_enq(i).valid) {
-        reqs(enqPtrExt(i).value) := io.sbuffer_enq(i)
-      }
-    }
-    enqPtrExt.map(ptr => ptr := ptr + count_vsreq)
-  }
-
-  XSPerfAccumulate("canNotEnqueue", !canEnqueue)
+  XSPerfAccumulate("canNotEnqueue", !queue.io.canEnqueue)
   XSPerfAccumulate("prefetch_train_fire", io.prefetch_train.fire)
-  XSPerfAccumulate("full", PopCount(reqs.map(_.valid)) === QueueSize.U)
+  XSPerfAccumulate("full", queue.io.validCount === QueueSize.U)
 }
 
 class StorePfWrapper()(implicit p: Parameters) extends DCacheModule with HasStorePrefetchHelper {
