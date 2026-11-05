@@ -5,6 +5,7 @@ import chisel3._
 import chisel3.util._
 import freechips.rocketchip.util._
 import utils._
+import utils.QueueModel.{QueueRTL, RingQueue}
 import utility._
 import xiangshan._
 import xiangshan.backend.fu.PMPRespBundle
@@ -150,101 +151,91 @@ trait HasTrainFilterHelper extends HasCircularQueuePtrHelper {
 
 // get prefetch train reqs from `exuParameters.LduCnt` load pipelines (up to `exuParameters.LduCnt`/cycle)
 // filter by cache line address, send out train req to stride (up to 1 req/cycle)
-class TrainFilter(size: Int, name: String)(implicit p: Parameters) extends XSModule with HasL1PrefetchHelper with HasTrainFilterHelper {
+class TrainFilter(size: Int, name: String)(implicit p: Parameters)
+  extends RingQueue[PrefetchReqBundle](
+    new PrefetchReqBundle,
+    size,
+    p(XSCoreParamsKey).backendParams.LduCnt,
+    1
+  )(p, QueueRTL) with HasL1PrefetchHelper with HasTrainFilterHelper {
+
+  private val enqLen = backendParams.LduCnt
+  require(size >= enqLen)
+
   val io = IO(new Bundle() {
     val enable = Input(Bool())
     val flush = Input(Bool())
     // train input, only from load for now
-    val ld_in = Flipped(Vec(backendParams.LduCnt, ValidIO(new LsPrefetchTrainBundle())))
+    val ld_in = Flipped(Vec(enqLen, ValidIO(new LsPrefetchTrainBundle())))
     // filter out
     val train_req = DecoupledIO(new PrefetchReqBundle())
   })
 
-  class Ptr(implicit p: Parameters) extends CircularQueuePtr[Ptr]( p => size ){}
-  object Ptr {
-    def apply(f: Bool, v: UInt)(implicit p: Parameters): Ptr = {
-      val ptr = Wire(new Ptr)
-      ptr.flag := f
-      ptr.value := v
-      ptr
-    }
+  private val offsetW = log2Ceil(size + 1)
+  private val slotValid = Wire(Vec(size, Bool()))
+  for (j <- 0 until size) {
+    // Physical slot j is head-relative only when the head is at zero. Rotate the
+    // offset explicitly so dedup follows the live interval [deqPtr, enqPtr).
+    val direct = j.U - deqPtr.value
+    val wrapped = size.U + j.U - deqPtr.value
+    val offset = Mux(j.U >= deqPtr.value, direct, wrapped)(offsetW - 1, 0)
+    slotValid(j) := offset < count
   }
 
-  val entries = Reg(Vec(size, new PrefetchReqBundle))
-  val valids = RegInit(VecInit(Seq.fill(size){ (false.B) }))
+  private val ld_in_reordered = reorder(io.ld_in)
+  private val reqs_l = ld_in_reordered.map(_.bits.toPrefetchReqBundle())
+  private val reqs_vl = ld_in_reordered.map(_.valid)
 
-  // enq
-  val enqLen = backendParams.LduCnt
-  val enqPtrExt = RegInit(VecInit((0 until enqLen).map(_.U.asTypeOf(new Ptr))))
-  val deqPtrExt = RegInit(0.U.asTypeOf(new Ptr))
+  private val needAlloc = Wire(Vec(enqLen, Bool()))
+  private val canAlloc = Wire(Vec(enqLen, Bool()))
 
-  val deqPtr = WireInit(deqPtrExt.value)
-
-  require(size >= enqLen)
-
-  val ld_in_reordered = reorder(io.ld_in)
-  val reqs_l = ld_in_reordered.map(_.bits.toPrefetchReqBundle())
-  val reqs_vl = ld_in_reordered.map(_.valid)
-  val needAlloc = Wire(Vec(enqLen, Bool()))
-  val canAlloc = Wire(Vec(enqLen, Bool()))
-
-  for(i <- (0 until enqLen)) {
+  private var acceptedSoFar = 0.U(log2Ceil(size + 1).W)
+  for (i <- 0 until enqLen) {
     val req = reqs_l(i)
     val req_v = reqs_vl(i)
-    val index = PopCount(needAlloc.take(i))
-    val allocPtr = enqPtrExt(index)
-    val entry_match = Cat(entries.zip(valids).map {
-      case(e, v) => v && block_hash_tag(e.vaddr) === block_hash_tag(req.vaddr)
+    val entry_match = Cat((0 until size).map { j =>
+      slotValid(j) && block_hash_tag(read(j).vaddr) === block_hash_tag(req.vaddr)
     }).orR
-    val prev_enq_match = if(i == 0) false.B else Cat(reqs_l.zip(reqs_vl).take(i).map {
-      case(pre, pre_v) => pre_v && block_hash_tag(pre.vaddr) === block_hash_tag(req.vaddr)
+    val prev_enq_match = if (i == 0) false.B else Cat(reqs_l.zip(reqs_vl).take(i).map {
+      case (pre, pre_v) => pre_v && block_hash_tag(pre.vaddr) === block_hash_tag(req.vaddr)
     }).orR
 
     needAlloc(i) := req_v && !entry_match && !prev_enq_match
-    canAlloc(i) := needAlloc(i) && allocPtr >= deqPtrExt && io.enable
-
-    when(canAlloc(i)) {
-      valids(allocPtr.value) := true.B
-      entries(allocPtr.value) := req
-    }
-  }
-  val allocNum = PopCount(canAlloc)
-
-  enqPtrExt.foreach{case x => when(canAlloc.asUInt.orR) {x := x + allocNum} }
-
-  // deq
-  io.train_req.valid := false.B
-  io.train_req.bits := DontCare
-  valids.zip(entries).zipWithIndex.foreach {
-    case((valid, entry), i) => {
-      when(deqPtr === i.U) {
-        io.train_req.valid := valid && io.enable
-        io.train_req.bits := entry
-      }
-    }
+    canAlloc(i) := needAlloc(i) && acceptedSoFar < (size.U - count) && io.enable
+    acceptedSoFar = acceptedSoFar + canAlloc(i)
   }
 
-  when(io.train_req.fire) {
-    valids(deqPtr) := false.B
-    deqPtrExt := deqPtrExt + 1.U
+  enq(reqs_l.toSeq, canAlloc.toSeq)
+  private val allocNum = PopCount(canAlloc)
+
+  private val valid = count =/= 0.U && io.enable
+  private val head = read(deqPtr.value)
+  private val fire = valid && io.train_req.ready
+  io.train_req.valid := valid
+  io.train_req.bits := head
+  advanceDeq(fire.asUInt)
+
+  private val flushDelayed = RegNext(io.flush)
+  emitRTL()
+
+  // Baseline flush order: accepted payload writes commit at the old tail first,
+  // then validity and endpoints reset. Drive the endpoint reset locally so the
+  // payload writes are not suppressed by RingQueue's flush gate.
+  when(flushDelayed) {
+    enqPtr := 0.U.asTypeOf(new QueuePtr)
+    deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  when(RegNext(io.flush)) {
-    valids.foreach {case valid => valid := false.B}
-    (0 until enqLen).map {case i => enqPtrExt(i) := i.U.asTypeOf(new Ptr)}
-    deqPtrExt := 0.U.asTypeOf(new Ptr)
-  }
+  XSPerfAccumulate(s"${name}_train_filter_full", count === size.U)
+  XSPerfAccumulate(s"${name}_train_filter_half", count >= (size / 2).U)
+  XSPerfAccumulate(s"${name}_train_filter_empty", count === 0.U)
 
-  XSPerfAccumulate(s"${name}_train_filter_full", PopCount(valids) === size.U)
-  XSPerfAccumulate(s"${name}_train_filter_half", PopCount(valids) >= (size / 2).U)
-  XSPerfAccumulate(s"${name}_train_filter_empty", PopCount(valids) === 0.U)
-
-  val raw_enq_pattern = Cat(reqs_vl)
-  val filtered_enq_pattern = Cat(needAlloc)
-  val actual_enq_pattern = Cat(canAlloc)
+  private val raw_enq_pattern = Cat(reqs_vl)
+  private val filtered_enq_pattern = Cat(needAlloc)
+  private val actual_enq_pattern = Cat(canAlloc)
   XSPerfAccumulate(s"${name}_train_filter_enq", allocNum > 0.U)
-  XSPerfAccumulate(s"${name}_train_filter_deq", io.train_req.fire)
-  for(i <- 0 until (1 << enqLen)) {
+  XSPerfAccumulate(s"${name}_train_filter_deq", fire)
+  for (i <- 0 until (1 << enqLen)) {
     XSPerfAccumulate(s"${name}_train_filter_raw_enq_pattern_${toBinary(i)}", raw_enq_pattern === i.U)
     XSPerfAccumulate(s"${name}_train_filter_filtered_enq_pattern_${toBinary(i)}", filtered_enq_pattern === i.U)
     XSPerfAccumulate(s"${name}_train_filter_actual_enq_pattern_${toBinary(i)}", actual_enq_pattern === i.U)
