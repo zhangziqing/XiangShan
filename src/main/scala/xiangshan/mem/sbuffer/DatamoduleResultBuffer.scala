@@ -25,6 +25,7 @@ import xiangshan._
 import utils._
 import utility._
 import xiangshan.cache._
+import utils.QueueModel.{QueueRTL, RingQueue}
 import difftest._
 
 class DatamoduleResultBufferIO[T <: Data](gen: T)(implicit p: Parameters) extends XSBundle
@@ -38,57 +39,105 @@ class DatamoduleResultBufferIO[T <: Data](gen: T)(implicit p: Parameters) extend
 class DatamoduleResultBuffer[T <: Data]
 (
   gen: T,
-)(implicit p: Parameters) extends XSModule {
+)(implicit p: Parameters) extends RingQueue[T](
+  gen,
+  p(XSCoreParamsKey).EnsbufferWidth,
+  p(XSCoreParamsKey).EnsbufferWidth,
+  p(XSCoreParamsKey).EnsbufferWidth
+)(p, QueueRTL) {
 
-  val genType = {
-    requireIsChiselType(gen)
-    gen
-  }
+  private val n = p(XSCoreParamsKey).EnsbufferWidth
+
+  requireIsChiselType(gen)
 
   val io = IO(new DatamoduleResultBufferIO[T](gen))
 
-  val data = Reg(Vec(EnsbufferWidth, genType))
-  val valids = RegInit(VecInit(Seq.fill(EnsbufferWidth)(false.B)))
-  val enq_flag = RegInit(0.U(log2Up(EnsbufferWidth).W)) // head is entry 0
-  val deq_flag = RegInit(0.U(log2Up(EnsbufferWidth).W)) // tail is entry 0
+  if (isPow2(n)) {
+  /** Baseline contracts: enqueue valid lanes and dequeue ready lanes are prefixes.
+    * Read the old endpoint state, then release the prefix that actually fires and
+    * reuse those slots for this cycle's accepted enqueues. RingQueue applies
+    * enqueue writes after dequeue advancement, so a same-slot replacement wins,
+    * matching the baseline clear-then-write order.
+    */
+  val readyPrefix = Wire(Vec(n, Bool()))
+  readyPrefix(0) := io.deq(0).ready
+  for (i <- 1 until n) {
+    readyPrefix(i) := readyPrefix(i - 1) && io.deq(i).ready
+  }
+  val readyCount = PopCount(readyPrefix)
+  val deqCount = Mux(count >= readyCount, readyCount, count)
+  val heads = deq(deqCount, (0 until n).map(_.U))
 
-  val entry_allowin = Wire(Vec(EnsbufferWidth, Bool()))
+  val validPrefix = Wire(Vec(n, Bool()))
+  validPrefix(0) := io.enq(0).valid
+  for (i <- 1 until n) {
+    validPrefix(i) := validPrefix(i - 1) && io.enq(i).valid
+  }
+  val free = n.U + deqCount - count
+  val accepted = (0 until n).map(i => validPrefix(i) && i.U < free)
+  enq((0 until n).map(i => io.enq(i).bits).toSeq, accepted)
 
-  (0 until EnsbufferWidth).foreach(index => {
-    io.deq(index).valid := valids(deq_flag + index.U) && (if (index == 0) 1.B else io.deq(index - 1).valid)
-    io.deq(index).bits := data(deq_flag + index.U)
-  })
+  for (i <- 0 until n) {
+    // Occupancy is independent of the consumer's ready: a stalled queue still
+    // exposes its full valid prefix. Ready only controls this cycle's release.
+    io.deq(i).valid := i.U < count
+    io.deq(i).bits := heads(i)
+    // A lane is ready when its slot is free now or is released by this cycle's
+    // dequeue prefix. Both readiness and acceptance use the same prefix.
+    io.enq(i).ready := i.U < free
+  }
 
-  (1 until EnsbufferWidth).foreach(i => {
+  // Retain the baseline's prefix contracts on both directions. The two input
+  // prefixes are caller obligations; the two output prefixes follow from the
+  // implementation and are checked here as in the baseline.
+  for (i <- 1 until n) {
     assert(!(io.deq(i).valid && !io.deq(i - 1).valid))
     assert(!(io.deq(i).ready && !io.deq(i - 1).ready))
-  })
-
-  (0 until EnsbufferWidth).foreach(
-    index => entry_allowin(index) := !valids(index) || (0 until EnsbufferWidth).map(i => io.deq(i).fire && deq_flag + i.U === index.U).reduce(_ || _)
-  )
-
-  (0 until EnsbufferWidth).foreach(
-    index => io.enq(index).ready := entry_allowin(enq_flag + index.U) && (if (index == 0) 1.B else io.enq(index - 1).ready)
-  )
-
-  (1 until EnsbufferWidth).foreach(i => {
     assert(!(io.enq(i).ready && !io.enq(i - 1).ready))
     assert(!(io.enq(i).valid && !io.enq(i - 1).valid))
-  })
+  }
 
-  (0 until EnsbufferWidth).foreach(index =>
-    when(io.deq(index).fire) {
-      valids(deq_flag + index.U) := 0.B
-      if (EnsbufferWidth > 1) deq_flag := deq_flag + index.U + 1.U
-    }
-  )
+    emitRTL()
 
-  (0 until EnsbufferWidth).foreach(index =>
-    when(io.enq(index).fire) {
-      valids(enq_flag + index.U) := 1.B
-      data(enq_flag + index.U) := io.enq(index).bits
-      if (EnsbufferWidth > 1) enq_flag := enq_flag + index.U + 1.U
+  } else {
+    // Retain the exact legacy binary-index ring for non-power-of-two geometries,
+    // whose truncated index behaviour is not the same as capacity wrap.
+    val data = Reg(Vec(n, gen))
+    val valids = RegInit(VecInit(Seq.fill(n)(false.B)))
+    val enq_flag = RegInit(0.U(log2Up(n).W))
+    val deq_flag = RegInit(0.U(log2Up(n).W))
+    val entry_allowin = Wire(Vec(n, Bool()))
+
+    for (index <- 0 until n) {
+      io.deq(index).valid := valids(deq_flag + index.U) && (if (index == 0) 1.B else io.deq(index - 1).valid)
+      io.deq(index).bits := data(deq_flag + index.U)
     }
-  )
+    for (index <- 0 until n) {
+      entry_allowin(index) := !valids(index) ||
+        (0 until n).map(i => io.deq(i).fire && deq_flag + i.U === index.U).reduce(_ || _)
+    }
+    for (index <- 0 until n) {
+      io.enq(index).ready := entry_allowin(enq_flag + index.U) &&
+        (if (index == 0) 1.B else io.enq(index - 1).ready)
+    }
+    for (i <- 1 until n) {
+      assert(!(io.deq(i).valid && !io.deq(i - 1).valid))
+      assert(!(io.deq(i).ready && !io.deq(i - 1).ready))
+      assert(!(io.enq(i).ready && !io.enq(i - 1).ready))
+      assert(!(io.enq(i).valid && !io.enq(i - 1).valid))
+    }
+    for (index <- 0 until n) {
+      when(io.deq(index).fire) {
+        valids(deq_flag + index.U) := 0.B
+        if (n > 1) deq_flag := deq_flag + index.U + 1.U
+      }
+    }
+    for (index <- 0 until n) {
+      when(io.enq(index).fire) {
+        valids(enq_flag + index.U) := 1.B
+        data(enq_flag + index.U) := io.enq(index).bits
+        if (n > 1) enq_flag := enq_flag + index.U + 1.U
+      }
+    }
+  }
 }
