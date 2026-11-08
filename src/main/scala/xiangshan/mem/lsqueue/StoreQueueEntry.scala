@@ -10,8 +10,8 @@ import xiangshan.backend.Bundles.DynInst
 
 /** Metadata retained by one StoreQueue element.
   *
-  * All fields are updated through the owning queue's absolute-slot update
-  * callback; no slot identity is stored in the payload.
+  * All fields are updated through the owning queue's absolute-slot indexed
+  * writes; no slot identity is stored in the payload.
   */
 class StoreQueueEntry(implicit p: Parameters) extends XSBundle {
   val uop = new DynInst
