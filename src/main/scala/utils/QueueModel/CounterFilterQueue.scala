@@ -37,11 +37,11 @@ class CounterFilterQueueIO[T <: Data](
   * occupancy, and a same-slot enqueue writes payload while retirement clears
   * validity.
   *
-  * RingQueue's automatic enqueue writes override ordinary updates, so the
+  * RingQueue emits automatic enqueue writes after registered updates, so the
   * same-slot case is encoded by masking the incoming `valid` with the
   * retirement address: the payload still writes, and validity is already
-  * false. The retirement update then clears every non-aliased retiring slot.
-  * No base class changes.
+  * false. Indexed retirement writes then clear every non-aliased retiring
+  * slot.
   */
 class CounterFilterQueue[T <: Data](
   gen: T,
@@ -83,14 +83,11 @@ class CounterFilterQueue[T <: Data](
   }
   enq(incoming.toSeq, accepted)
 
-  // Retire the old head prefix regardless of occupancy, then advance by the
-  // full registered count. Neither step is count-gated.
-  update { entry =>
-    for (j <- 0 until numDeq) {
-      when((j.U < io.retireCount) && ((deqPtr + j.U).value === physicalSlot(entry).U)) {
-        entry.valid := false.B
-      }
-    }
+  // Retire the old head prefix regardless of occupancy. Normal deq advances by
+  // the full registered count without an occupancy check; its candidate reads
+  // are unused.
+  for (j <- 0 until numDeq) {
+    writeField((deqPtr + j.U).value, (entry: ValidIO[T]) => entry.valid, false.B, j.U < io.retireCount)
   }
-  advanceDeq(io.retireCount)
+  deq(io.retireCount)
 }
