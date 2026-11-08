@@ -25,12 +25,12 @@ class SmsTrainFilterQueueIO[T <: Data](gen: T, entries: Int, numEnq: Int) extend
 
 /** SMS TrainFilter storage on the current RingQueue API.
   *
-  * This is deliberately owner-local rather than a shared peekable queue:
-  * `physicalSlot` is package-private and the SMS policy is the only consumer
-  * of this exact interface. Admission and dequeue use the legacy circular
-  * pointer comparison, not a dense count, so the old-state semantics survive
-  * reset and wrap. Payload reset stays zero through `initContents`, matching
-  * the baseline raw invalid output.
+  * This is deliberately owner-local rather than a shared peekable queue: the
+  * SMS policy is the only consumer of its per-slot peek and legacy pointer
+  * admission interface. Admission and dequeue use the legacy circular pointer
+  * comparison, not a dense count, so the old-state semantics survive reset and
+  * wrap. Payload reset stays zero through `initContents`, matching the
+  * baseline raw invalid output.
   */
 class SmsTrainFilterQueue[T <: Data](
   gen: T,
@@ -64,15 +64,12 @@ class SmsTrainFilterQueue[T <: Data](
   // preserve here.
   enq(incoming.toSeq, accepted)
 
-  // One valid head drains per cycle. Invalid heads leave the pointer and
-  // stale payload untouched, preserving the raw invalid output.
+  // One valid head drains per cycle through the normal transfer. Invalid heads
+  // leave the pointer and stale payload untouched, preserving the raw invalid
+  // output.
   private val head = read(deqPtr.value)
   io.deq.valid := head.valid
   io.deq.bits := head.bits
-  update { entry =>
-    when(head.valid && deqPtr.value === physicalSlot(entry).U) {
-      entry.valid := false.B
-    }
-  }
-  advanceDeq(head.valid.asUInt)
+  writeField(deqPtr.value, (entry: ValidIO[T]) => entry.valid, false.B, head.valid)
+  deq(head.valid.asUInt)
 }
