@@ -213,7 +213,7 @@ class TrainFilter(size: Int, name: String)(implicit p: Parameters)
   private val fire = valid && io.train_req.ready
   io.train_req.valid := valid
   io.train_req.bits := head
-  advanceDeq(fire.asUInt)
+  deq(fire.asUInt)
 
   private val flushDelayed = RegNext(io.flush)
   emitRTL()
