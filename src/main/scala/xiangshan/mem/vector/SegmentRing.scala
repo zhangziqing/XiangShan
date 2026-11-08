@@ -18,7 +18,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility._
-import utils.QueueModel.{IndexedSegmentRing, QueueRTL}
+import utils.QueueModel.{QueueRTL, RingQueue}
 import xiangshan._
 import xiangshan.backend.Bundles.DynInst
 
@@ -70,25 +70,24 @@ class SegmentRingIO(maxSize: Int, numRead: Int)(implicit p: Parameters) extends 
   val empty  = Output(Bool())
 }
 
-/** Dedicated segment ring composed on [[IndexedSegmentRing]].
+/** Dedicated segment ring composed on [[RingQueue]].
   *
-  * The QueueModel core owns the two wrap-carrying cursors, the unreset payload
-  * storage and the enqueue/dequeue transfer. This owner supplies the segment IO
-  * and the indexed payload extension:
+  * The core owns the two wrap-carrying cursors, the unreset payload storage and
+  * the enqueue/dequeue transfer. This owner supplies the segment IO:
   *   - enqueue writes the whole transaction at `enqPtr.value`;
   *   - a merge at the same physical slot is folded into the enqueue payload's
   *     `data` field, so the core's enqueue-last whole-entry write keeps the
   *     legacy "enqueue uop/stride, merge data" priority;
   *   - a merge at any other physical slot is a field-only pre-enqueue `data`
-  *     write, leaving `uop`/`stride` untouched;
+  *     write through `writeField`, leaving `uop`/`stride` untouched;
   *   - dequeue presents the head entry and advances only on `fire`;
-  *   - reads are raw combinational views of an explicit physical slot with no
-  *     validity or reset gating;
+  *   - reads are raw combinational indexed views of an explicit physical slot
+  *     with no validity or reset gating;
   *   - payload registers stay unreset, so reset-concurrent enqueue/merge writes
   *     are captured exactly like the baseline `Reg` arrays.
   */
 class SegmentRing(maxSize: Int, numRead: Int)(implicit p: Parameters)
-  extends IndexedSegmentRing[SegmentRingEntry](
+  extends RingQueue[SegmentRingEntry](
     new SegmentRingEntry, maxSize, 1, 1
   )(p, QueueRTL) {
 
@@ -101,30 +100,35 @@ class SegmentRing(maxSize: Int, numRead: Int)(implicit p: Parameters)
   // Legacy order is whole-entry enqueue, then a data-only merge on a coincident
   // slot. RingQueue emits the enqueue batch last, so route a same-slot merge
   // into the enqueue payload instead of writing `data` after that batch.
-  val sameSlotMerge  = io.merge.valid && io.merge.bits.addr === enqPtr.value
+  val sameSlotMerge   = io.merge.valid && io.merge.bits.addr === enqPtr.value
   val enqCarriesMerge = sameSlotMerge && io.enq.valid
 
-  // Field-only writes for slots not claimed by a same-cycle enqueue. These are
-  // emitted before the deferred enqueue batch and are not reset-gated.
-  indexedUpdate(io.merge.bits.addr, io.merge.valid && !enqCarriesMerge) { entry =>
-    entry.data := io.merge.bits.data
-  }
+  // Field-only indexed write for a slot not claimed by a same-cycle enqueue.
+  // The explicit enable is complete; the core emits it before the enqueue batch.
+  writeField(
+    io.merge.bits.addr,
+    (entry: SegmentRingEntry) => entry.data,
+    io.merge.bits.data,
+    io.merge.valid && !enqCarriesMerge
+  )
 
   // A coincident merge replaces only `data`; enqueue still owns uop/stride.
   val enqEntry = WireInit(io.enq.bits)
   when(enqCarriesMerge) {
     enqEntry.data := io.merge.bits.data
   }
-  enq(Seq(enqEntry), io.enq.valid)
-  deq(io.deq.fire)
+  enq(Seq(enqEntry), Seq(io.enq.valid))
 
+  // Read and consume the old head. `deq` returns the pre-edge slot even when
+  // the advance count is zero, so the dequeue payload remains valid while empty.
+  val deqEntry = deq(io.deq.fire.asUInt).head
   io.deq.valid := !empty
-  io.deq.bits  := deqData(0)
+  io.deq.bits  := deqEntry
 
   // Raw physical-slot views for the caller's split/stride cursors; no validity
   // or reset gating.
   for (i <- 0 until numRead) {
-    io.read(i).data := indexedRead(io.read(i).addr)
+    io.read(i).data := read(io.read(i).addr)
   }
 
   emitRTL()

@@ -19,6 +19,7 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.{IndexFreeList, QueueRTL}
 import utility._
 import xiangshan._
 import xiangshan.backend.rob.RobPtr
@@ -112,13 +113,13 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   // +---+---+--------------+-----+-----+
   // | 0 | 1 |      ......  | n-2 | n-1 |
   // +---+---+--------------+-----+-----+
-  val freeList = Module(new FreeList(
-    size = LoadQueueRARSize,
+  val freeList = Module(new IndexFreeList(
+    entries = LoadQueueRARSize,
     allocWidth = LoadPipelineWidth,
     freeWidth = 4,
     enablePreAlloc = false,
     moduleName = "LoadQueueRAR freelist"
-  ))
+  )(p, QueueRTL))
   freeList.io := DontCare
 
   // Real-allocation: load_s2

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Pointer-only Module foundation and pointer-derived Queue observations.
 package utils.QueueModel
 
 import chisel3._
@@ -7,59 +6,74 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.{CircularQueuePtr, HasCircularQueuePtrHelper}
 
-/** Owns only the two circular pointers and declares element-access contracts.
-  * Payload, IO, admission, access lowering and recovery belong to a concrete
-  * Queue implementation.
-  *
-  * `p(expandRTL)` selects ordinary circuit expansion. The alternative circuit
-  * is deliberately unspecified; implementations must reject it until supplied.
-  * Reset-full places the tail one phase ahead of the head at the same index.
-  */
+case object QueueRTL extends Field[Boolean](true)
+
+/** Shared queue interfaces; subclasses own storage and emission. */
 abstract class QueueBase[T <: Data](val entries: Int)(
   implicit val p: Parameters,
   val expandRTL: Field[Boolean]
 ) extends Module {
   require(entries > 0, "Queue capacity must be positive")
 
-  /** Bound to this Queue's capacity. `flag` is the circular ordering phase,
-    * never an element-valid bit. A single-slot pointer has zero index bits,
-    * leaving its phase as the entire pointer for inherited arithmetic.
-    */
+  /** The phase distinguishes full from empty; a single slot has no index bits. */
   protected class QueuePtr extends CircularQueuePtr[QueuePtr](QueueBase.this.entries) {
     override val value = UInt(log2Ceil(QueueBase.this.entries).W)
   }
 
+  // Reset hooks run before subclass fields initialize.
   protected def enqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
   protected def deqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
 
-  protected val enqPtrReg: QueuePtr = RegInit(enqPtrInit)
-  protected val deqPtrReg: QueuePtr = RegInit(deqPtrInit)
-  protected def enqPtr: QueuePtr = enqPtrReg
-  protected def deqPtr: QueuePtr = deqPtrReg
+  protected val enqPtr: QueuePtr = RegInit(enqPtrInit)
+  protected val deqPtr: QueuePtr = RegInit(deqPtrInit)
 
-  /** Observe current elements at the call site, without saving the callback.
-    * The read-only callback supplies its own guards; the Queue adds no
-    * membership filter.
-    */
+  /** Read-only current state; the index must address a physical slot. */
+  protected def read(index: Int): T
+  protected def read(index: UInt): T
+
+  /** Indexed writes do not advance either pointer or perform admission checks. */
+  protected def write(index: UInt, data: T, enable: Bool): Unit
+
+  /** field selects a static path within the entry without side effects. */
+  protected def writeField[D <: Data](index: UInt, field: T => D, data: D, enable: Bool): Unit
+
+  /** Read-only traversal without implicit validity filtering. */
   protected def foreach(read: T => Unit): Unit
 
-  /** Compose element updates under the pure-function assumption:
-    * update(f); update(g) = update(compose(f, g)). Reads observe current state;
-    * field-wise, last-enabled-write priority is preserved at the cycle edge.
-    * The concrete implementation supplies an explicit circuit emission step.
-    */
+  /** Register outside when; RHS reads old state and later enabled writes win per field. */
   protected def update(modify: T => Unit): Unit
 
-  /** OR the caller's predicate over current storage elements. The predicate
-    * supplies any validity test required by the concrete Queue contract.
-    */
+  /** Uses the same read-only, unfiltered observation contract as foreach. */
   protected def exists(predicate: T => Bool): Bool
+
+  /** Return one acceptance bit per input; invalid inputs must be rejected. */
+  protected def enqGuard(elements: Seq[ValidIO[T]]): Seq[Bool]
+
+  /** Gates consumption; reads remain visible. */
+  protected def deqGuard(count: UInt): Bool
+
+  /** Later registrations can replace writes without revoking this call's result. */
+  protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool]
+
+  /** Bypasses enqGuard. Accepted inputs pack in order and override ordinary writes.
+    * The last registration wins, including an all-false mask.
+    */
+  protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit
+
+  /** Read from the old head; callers keep consumption within current occupancy. */
+  protected def deq(count: UInt, offsets: Seq[UInt]): Seq[T]
+
+  /** Normally use enq; this bypasses admission and payload writes. */
+  protected def advanceEnq(count: UInt): Unit
+
+  /** Normally use deq; this bypasses admission and payload reads. */
+  protected def advanceDeq(count: UInt): Unit
+
+  protected def onRecover(): Unit
+  protected def onFlush(): Unit
 }
 
-/** Observations for a Queue whose live interval is [deqPtr, enqPtr).
-  * The pointers must remain ordered with distance at most `entries`. This
-  * trait adds combinational expressions only and cannot be mixed into an IO.
-  */
+/** Requires a dense pointer interval of at most entries; ignores per-slot validity. */
 trait QueueStatus extends HasCircularQueuePtrHelper { this: QueueBase[_] =>
   protected final def count: UInt = {
     val result = Wire(UInt(log2Ceil(entries + 1).W))
