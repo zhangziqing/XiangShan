@@ -101,15 +101,15 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqDefinition: Option[(Seq[T], Seq[Bool])] = None
+  private var enqDefinition: Option[(Seq[T], Seq[Bool], Option[Seq[UInt]])] = None
 
   /** Call once after registration, inside Module construction. */
   final def emitRTL(): this.type = {
-    val (elements, accepted) = enqDefinition.getOrElse {
+    val (elements, accepted, offsets) = enqDefinition.getOrElse {
       throw new IllegalArgumentException("enqueue must be registered before emission")
     }
     emitUpdates()
-    emitEnq(elements, accepted)
+    emitEnq(elements, accepted, offsets)
     this
   }
 
@@ -125,19 +125,38 @@ abstract class RingQueue[T <: Data](
     accepted
   }
 
-  override protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+  override protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit =
+    registerEnq(elements, accepted, None)
+
+  /** Register accepted inputs at explicit tail-relative writer offsets.
+    * Only `accepted(i)` writes, at `(enqPtr + offsets(i)).value`; an enabled
+    * offset must address a physical slot in `[0, entries)`. Aliased offsets
+    * write in port order, so the later port wins. The tail still advances by
+    * the accepted count. Offsets need not be a packed prefix, so a concrete
+    * owner can preserve fixed physical lanes. The two-argument enqueue above
+    * remains the default packed placement.
+    */
+  protected def enq(elements: Seq[T], accepted: Seq[Bool], offsets: Seq[UInt]): Unit =
+    registerEnq(elements, accepted, Some(offsets))
+
+  private def registerEnq(
+    elements: Seq[T], accepted: Seq[Bool], offsets: Option[Seq[UInt]]
+  ): Unit = {
     requireRegistrationScope()
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
+    require(offsets.forall(_.length == elements.length), "enqueue data and offset widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqDefinition = Some((elements, accepted))
+    enqDefinition = Some((elements, accepted, offsets))
   }
 
-  private def emitEnq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
+  private def emitEnq(
+    elements: Seq[T], accepted: Seq[Bool], offsets: Option[Seq[UInt]]
+  ): Unit = {
     when(!recover && !flush) {
       for (i <- elements.indices) {
         when(accepted(i)) {
-          val offset = PopCount(accepted.take(i))
+          val offset = offsets.map(_(i)).getOrElse(PopCount(accepted.take(i)))
           contents((enqPtr + offset).value) := elements(i)
         }
       }
