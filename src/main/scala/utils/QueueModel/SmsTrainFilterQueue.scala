@@ -23,46 +23,39 @@ class SmsTrainFilterQueueIO[T <: Data](gen: T, entries: Int, numEnq: Int) extend
   val deq = Output(Valid(gen))
 }
 
-/** SMS TrainFilter storage on the current RingQueue API.
+/** SMS TrainFilter storage on the shared prefetch-filter base.
   *
-  * This is deliberately owner-local rather than a shared peekable queue: the
-  * SMS policy is the only consumer of its per-slot peek and legacy pointer
-  * admission interface. Admission and dequeue use the legacy circular pointer
-  * comparison, not a dense count, so the old-state semantics survive reset and
-  * wrap. Payload reset stays zero through `initContents`, matching the
-  * baseline raw invalid output.
+  * The base supplies zero payload reset and old-pointer required-lane
+  * admission without retirement credit. This owner adds the SMS IO, all-slot
+  * peek for block-tag dedup, and valid-head dequeue; the circular pointer
+  * comparison keeps the old-state semantics across reset and wrap.
   */
 class SmsTrainFilterQueue[T <: Data](
   gen: T,
   entries: Int,
   numEnq: Int
 )(implicit p: Parameters, expandRTL: Field[Boolean] = QueueRTL)
-    extends RingQueue[ValidIO[T]](Valid(gen), entries, numEnq, numDeq = 1) {
-
-  override protected def initContents: Option[Seq[ValidIO[T]]] =
-    Some(Seq.fill(entries)(0.U.asTypeOf(Valid(gen))))
+    extends PrefetchFilterQueue[T](gen, entries, numEnq, numDeq = 1) {
 
   val io = IO(new SmsTrainFilterQueueIO(gen, entries, numEnq))
 
   // Old-state visibility of every physical slot for block-tag dedup.
   for (i <- 0 until entries) { io.peek(i) := read(i) }
 
-  private val accepted = Wire(Vec(numEnq, Bool()))
-  private val incoming = Wire(Vec(numEnq, Valid(gen)))
+  private val incoming = Wire(Vec(numEnq, ValidIO(Valid(gen))))
   for (i <- 0 until numEnq) {
-    val rank = PopCount(io.enqNeed.take(i))
-    accepted(i) := io.enqNeed(i) && ((enqPtr + rank) >= deqPtr)
-    io.enqAccepted(i) := accepted(i)
-    incoming(i).valid := true.B
-    incoming(i).bits := io.enqBits(i)
+    incoming(i).valid := io.enqNeed(i)
+    incoming(i).bits.valid := true.B
+    incoming(i).bits.bits := io.enqBits(i)
   }
-  // RingQueue compacts accepted lanes in port order. In the dense SMS interval
-  // an accepted needed lane implies every earlier needed lane is accepted, so
-  // the compacted accepted-rank equals the baseline need-rank. Enqueue
-  // destinations are free while the dequeue head is occupied (or invalid), so
-  // an enqueue/dequeue alias is not reachable and has no priority case to
-  // preserve here.
-  enq(incoming.toSeq, accepted)
+  // The native guarded enqueue evaluates the shared required-lane admission
+  // once, then RingQueue compacts accepted lanes in port order. In the dense
+  // SMS interval an accepted needed lane implies every earlier needed lane is
+  // accepted, so the compacted accepted-rank equals the baseline need-rank.
+  // Enqueue destinations are free while the dequeue head is occupied (or
+  // invalid), so an enqueue/dequeue alias has no priority case to preserve.
+  val accepted = enq(incoming.toSeq)
+  for (i <- 0 until numEnq) { io.enqAccepted(i) := accepted(i) }
 
   // One valid head drains per cycle through the normal transfer. Invalid heads
   // leave the pointer and stale payload untouched, preserving the raw invalid
