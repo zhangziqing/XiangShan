@@ -46,10 +46,9 @@ class SparseLaneRingQueue[T <: Data](gen: T, entries: Int, lanes: Int)(
   io.canEnqueue := (distanceBetween(enqPtr, deqPtr) + offered) <= entries.U
   private val accepted = io.enq.map(element => element.valid && io.canEnqueue)
 
-  private val head = read(deqPtr.value)
+  private val head = deq(io.deq.fire.asUInt, Seq(0.U)).head
   io.deq.valid := head.valid
   io.deq.bits := head.bits
-  advanceDeq(io.deq.fire.asUInt)
 
   private val slotValids = Wire(Vec(entries, Bool()))
   for (slot <- 0 until entries) {
@@ -57,25 +56,22 @@ class SparseLaneRingQueue[T <: Data](gen: T, entries: Int, lanes: Int)(
   }
   io.validCount := PopCount(slotValids)
 
-  // Dequeue clear is registered before the enqueue writes, so a same-slot
+  // The dequeue clear is registered before the lane writes, so a same-slot
   // enqueue replaces the cleared entry and keeps its complete Valid payload.
-  update { entry =>
-    when(io.deq.fire && deqPtr.value === physicalSlot(entry).U) {
-      entry.valid := false.B
-    }
-  }
-  update { entry =>
-    val slot = physicalSlot(entry).U
-    for (lane <- 0 until lanes) {
-      when(accepted(lane) && (enqPtr + lane.U).value === slot) {
-        entry := io.enq(lane)
-      }
-    }
+  writeField(deqPtr.value, (entry: ValidIO[T]) => entry.valid, false.B, io.deq.fire)
+  for (lane <- 0 until lanes) {
+    write((enqPtr + lane.U).value, io.enq(lane), accepted(lane))
   }
 
-  when(!recover && !flush && VecInit(accepted).asUInt.orR) {
-    enqPtr := enqPtr + PopCount(accepted)
-  }
+  // A packed enqueue places accepted lanes at successive offsets from the tail,
+  // but lane i must write tail+i even when a lower lane is absent. Register an
+  // all-false definition only to satisfy the required enqueue before emission;
+  // it writes no payload and advances the tail by zero.
+  enq(io.enq.toSeq, Seq.fill(lanes)(false.B))
+
+  // Exceptional direct advance: the fixed-lane writes above cannot be expressed
+  // by the packed enqueue, and the tail moves by the total accepted count.
+  advanceEnq(PopCount(accepted))
 
   // Emit inside this module so the registered update closures run in their
   // owner's elaboration context rather than the parent's.
