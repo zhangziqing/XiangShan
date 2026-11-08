@@ -6,51 +6,74 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.{CircularQueuePtr, HasCircularQueuePtrHelper}
 
-/** Select ordinary QueueModel circuit generation. */
 case object QueueRTL extends Field[Boolean](true)
 
-/** Owns the circular enqueue/dequeue pointers; subclasses provide payload storage. */
+/** Shared queue interfaces; subclasses own storage and emission. */
 abstract class QueueBase[T <: Data](val entries: Int)(
   implicit val p: Parameters,
   val expandRTL: Field[Boolean]
 ) extends Module {
   require(entries > 0, "Queue capacity must be positive")
 
-  /** Use the wrap phase to distinguish full from empty at the same index.
-    * A single-slot queue needs only the phase bit.
-    */
+  /** The phase distinguishes full from empty; a single slot has no index bits. */
   protected class QueuePtr extends CircularQueuePtr[QueuePtr](QueueBase.this.entries) {
     override val value = UInt(log2Ceil(QueueBase.this.entries).W)
   }
 
+  // Reset hooks run before subclass fields initialize.
   protected def enqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
   protected def deqPtrInit: QueuePtr = 0.U.asTypeOf(new QueuePtr)
 
   protected val enqPtr: QueuePtr = RegInit(enqPtrInit)
   protected val deqPtr: QueuePtr = RegInit(deqPtrInit)
 
-  /** Read all physical slots now; apply any validity guard in the callback. */
+  /** Read-only current state; the index must address a physical slot. */
+  protected def read(index: Int): T
+  protected def read(index: UInt): T
+
+  /** Indexed writes do not advance either pointer or perform admission checks. */
+  protected def write(index: UInt, data: T, enable: Bool): Unit
+
+  /** field selects a static path within the entry without side effects. */
+  protected def writeField[D <: Data](index: UInt, field: T => D, data: D, enable: Bool): Unit
+
+  /** Read-only traversal without implicit validity filtering. */
   protected def foreach(read: T => Unit): Unit
 
-  /** Register per-entry writes for later emission. Reads see current state;
-    * later enabled writes win per field.
-    */
+  /** Register outside when; RHS reads old state and later enabled writes win per field. */
   protected def update(modify: T => Unit): Unit
 
-  /** Register elements and acceptance for later enqueue emission. Accepted
-    * elements occupy successive positions from the old tail in input order;
-    * their population count determines the tail advance. A later registration
-    * replaces the earlier definition. Admission belongs to the concrete owner.
+  /** Uses the same read-only, unfiltered observation contract as foreach. */
+  protected def exists(predicate: T => Bool): Bool
+
+  /** Return one acceptance bit per input; invalid inputs must be rejected. */
+  protected def enqGuard(elements: Seq[ValidIO[T]]): Seq[Bool]
+
+  /** Gates consumption; reads remain visible. */
+  protected def deqGuard(count: UInt): Bool
+
+  /** Later registrations can replace writes without revoking this call's result. */
+  protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool]
+
+  /** Bypasses enqGuard. Accepted inputs pack in order and override ordinary writes.
+    * The last registration wins, including an all-false mask.
     */
   protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit
 
-  /** Test all physical slots; include any validity check in the predicate. */
-  protected def exists(predicate: T => Bool): Bool
+  /** Read from the old head; callers keep consumption within current occupancy. */
+  protected def deq(count: UInt, offsets: Seq[UInt]): Seq[T]
+
+  /** Normally use enq; this bypasses admission and payload writes. */
+  protected def advanceEnq(count: UInt): Unit
+
+  /** Normally use deq; this bypasses admission and payload reads. */
+  protected def advanceDeq(count: UInt): Unit
+
+  protected def onRecover(): Unit
+  protected def onFlush(): Unit
 }
 
-/** Derive occupancy from the live interval [deqPtr, enqPtr).
-  * Requires a pointer distance of at most `entries`.
-  */
+/** Requires a dense pointer interval of at most entries; ignores per-slot validity. */
 trait QueueStatus extends HasCircularQueuePtrHelper { this: QueueBase[_] =>
   protected final def count: UInt = {
     val result = Wire(UInt(log2Ceil(entries + 1).W))
