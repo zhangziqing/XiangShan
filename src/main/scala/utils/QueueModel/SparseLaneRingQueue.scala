@@ -42,9 +42,29 @@ class SparseLaneRingQueue[T <: Data](gen: T, entries: Int, lanes: Int)(
   override protected def initContents: Option[Seq[ValidIO[T]]] =
     Some((0 until entries).map(_.U.asTypeOf(Valid(gen))))
 
-  private val offered = PopCount(io.enq.map(_.valid))
-  io.canEnqueue := (distanceBetween(enqPtr, deqPtr) + offered) <= entries.U
-  private val accepted = io.enq.map(element => element.valid && io.canEnqueue)
+  private val admitted = WireDefault(false.B)
+  io.canEnqueue := admitted
+
+  /** Owner admission: old pointer distance plus offered count, no dequeue credit. */
+  override protected def enqGuard(elements: Seq[ValidIO[ValidIO[T]]]): Seq[Bool] = {
+    val canAccept = (distanceBetween(enqPtr, deqPtr) + PopCount(elements.map(_.valid))) <= entries.U
+    admitted := canAccept
+    elements.map(element => element.valid && canAccept)
+  }
+
+  /** The element type is already ValidIO[T], so alias each port's valid into
+    * the guard's per-input Valid wrapper without adding admission logic.
+    */
+  private def guardInput(element: ValidIO[T]): ValidIO[ValidIO[T]] = {
+    val wrapped = Wire(Valid(chiselTypeOf(element)))
+    wrapped.valid := element.valid
+    wrapped.bits := element
+    wrapped
+  }
+
+  // Evaluate the shared policy once; this decision feeds both canEnqueue and
+  // the real accepted lanes registered with the native fixed-lane enqueue.
+  private val accepted = enqGuard(io.enq.map(guardInput))
 
   private val head = deq(io.deq.fire.asUInt, Seq(0.U)).head
   io.deq.valid := head.valid
@@ -56,22 +76,13 @@ class SparseLaneRingQueue[T <: Data](gen: T, entries: Int, lanes: Int)(
   }
   io.validCount := PopCount(slotValids)
 
-  // The dequeue clear is registered before the lane writes, so a same-slot
-  // enqueue replaces the cleared entry and keeps its complete Valid payload.
+  // The dequeue clear is registered before the enqueue, so a same-slot enqueue
+  // replaces the cleared entry and keeps its complete Valid payload.
   writeField(deqPtr.value, (entry: ValidIO[T]) => entry.valid, false.B, io.deq.fire)
-  for (lane <- 0 until lanes) {
-    write((enqPtr + lane.U).value, io.enq(lane), accepted(lane))
-  }
 
-  // A packed enqueue places accepted lanes at successive offsets from the tail,
-  // but lane i must write tail+i even when a lower lane is absent. Register an
-  // all-false definition only to satisfy the required enqueue before emission;
-  // it writes no payload and advances the tail by zero.
-  enq(io.enq.toSeq, Seq.fill(lanes)(false.B))
-
-  // Exceptional direct advance: the fixed-lane writes above cannot be expressed
-  // by the packed enqueue, and the tail moves by the total accepted count.
-  advanceEnq(PopCount(accepted))
+  // Lane i keeps the fixed tail+i placement instead of packing accepted ports;
+  // native enqueue lowering performs the writes and advances the tail.
+  enq(io.enq.toSeq, accepted, (0 until lanes).map(_.U))
 
   // Emit inside this module so the registered update closures run in their
   // owner's elaboration context rather than the parent's.
