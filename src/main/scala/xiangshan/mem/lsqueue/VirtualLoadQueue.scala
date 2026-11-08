@@ -21,13 +21,11 @@ import chisel3._
 import chisel3.util._
 import chisel3.experimental.BundleLiterals._
 import utils._
-import utils.QueueModel.VirtualLoadQueueRing
+import utils.QueueModel.{QueueRTL, RingQueue}
 import utility._
 import xiangshan._
-import xiangshan.ExceptionNO._
 import xiangshan.backend.rob.{RobLsqIO, RobPtr}
 import xiangshan.backend.Bundles.{DynInst, MemExuOutput, UopIdx}
-import xiangshan.backend.fu.FuConfig.LduCfg
 import xiangshan.backend.decode.isa.bitfield.{InstVType, XSInstBitFields}
 import xiangshan.backend.fu.FuType
 import xiangshan.mem.Bundles._
@@ -44,14 +42,14 @@ class VirtualLoadQueuePayload(implicit p: Parameters) extends XSBundle {
 }
 
 /** The public protocol stays on VirtualLoadQueue; payload, validity and both
-  * circular cursors are the inherited RingQueue state. The parent keeps the
+  * circular cursors are the inherited RingQueue state. The owner keeps the
   * original lane-0 pointer policy, delayed retirement and redirect clamp.
   */
 class VirtualLoadQueue(implicit p: Parameters)
-  extends VirtualLoadQueueRing[VirtualLoadQueuePayload](
+  extends RingQueue[VirtualLoadQueuePayload](
     new VirtualLoadQueuePayload,
-    p(XSCoreParamsKey).VirtualLoadQueueSize
-  )(p)
+    p(XSCoreParamsKey).VirtualLoadQueueSize, 1, 1
+  )(p, QueueRTL)
   with HasDCacheParameters
   with HasCircularQueuePtrHelper
   with HasPerfEvents
@@ -100,7 +98,7 @@ class VirtualLoadQueue(implicit p: Parameters)
   val debug_mmio = Wire(Vec(VirtualLoadQueueSize, Bool()))
   val debug_paddr = Wire(Vec(VirtualLoadQueueSize, UInt(PAddrBits.W)))
   for (i <- 0 until VirtualLoadQueueSize) {
-    val e = readSlot(i)
+    val e = read(i)
     allocated(i) := e.valid
     robIdx(i) := e.robIdx
     uopIdx(i) := e.uopIdx
@@ -168,6 +166,7 @@ class VirtualLoadQueue(implicit p: Parameters)
   } .otherwise {
     enqPtrExtNext := VecInit((0 until io.enq.req.length).map(i => deqPtrNext + i.U))
   }
+  // Redirect recovery and the deq clamp install an absolute tail, not a count step.
   enqPtr.flag := enqPtrExtNext(0).flag
   enqPtr.value := enqPtrExtNext(0).value
 
@@ -184,14 +183,10 @@ class VirtualLoadQueue(implicit p: Parameters)
   val lastCommitCount = GatedRegNext(commitCount)
 
   // update deqPtr
-  // cycle 1: generate deqPtrNext
-  // cycle 2: update deqPtr
-  val deqPtrUpdateEna = lastCommitCount =/= 0.U
+  // lastCommitCount was registered from cycle 1; deq consumes it at this edge.
+  // deqPtrNext remains the next head used by the tail clamp.
   deqPtrNext := deqPtrView + lastCommitCount
-  when(deqPtrUpdateEna) {
-    deqPtr.flag := deqPtrNext.flag
-    deqPtr.value := deqPtrNext.value
-  }
+  deq(lastCommitCount)
 
   io.lqDeq := GatedRegNext(lastCommitCount)
   io.lqCancelCnt := redirectCancelCount
@@ -223,18 +218,15 @@ class VirtualLoadQueue(implicit p: Parameters)
     }
     val entryCanEnq = entryCanEnqSeq.reduce(_ || _)
     val selectBits = ParallelPriorityMux(entryCanEnqSeq, io.enq.req.map(_.bits))
-    updateSlot(i.U) { e =>
-      when (entryCanEnq) {
-        e.valid := true.B
-        e.robIdx := selectBits.robIdx
-        e.uopIdx := selectBits.uopIdx
-        e.isvec :=  FuType.isVLoad(selectBits.fuType)
-        e.committed := false.B
-
-        e.debug_mmio := false.B
-        e.debug_paddr := 0.U
-      }
-    }
+    val enqEntry = Wire(new VirtualLoadQueuePayload)
+    enqEntry.valid := true.B
+    enqEntry.robIdx := selectBits.robIdx
+    enqEntry.uopIdx := selectBits.uopIdx
+    enqEntry.isvec := FuType.isVLoad(selectBits.fuType)
+    enqEntry.committed := false.B
+    enqEntry.debug_mmio := false.B
+    enqEntry.debug_paddr := 0.U
+    write(i.U, enqEntry, entryCanEnq)
   }
 
   for (i <- 0 until io.enq.req.length) {
@@ -252,11 +244,7 @@ class VirtualLoadQueue(implicit p: Parameters)
     */
   (0 until DeqPtrMoveStride).map(i => {
     val slot = (deqPtrView + i.U).value
-    updateSlot(slot) { e =>
-      when (commitCount > i.U) {
-        e.valid := false.B
-      }
-    }
+    writeField(slot, _.valid, false.B, commitCount > i.U)
     XSError(commitCount > i.U && !allocated(slot), s"why commit invalid entry $i?\n")
   })
 
@@ -270,21 +258,13 @@ class VirtualLoadQueue(implicit p: Parameters)
     }
     vecLdCommit(i) := vecLdCommittmp(i).reduce(_ || _)
 
-    updateSlot(i.U) { e =>
-      when (vecLdCommit(i) && e.isvec) {
-        e.committed := true.B
-      }
-    }
+    writeField(i.U, _.committed, true.B, vecLdCommit(i) && isvec(i))
   }
 
   // misprediction recovery / exception redirect
   // invalidate lq term using robIdx
   for (i <- 0 until VirtualLoadQueueSize) {
-    updateSlot(i.U) { e =>
-      when (needCancel(i)) {
-        e.valid := false.B
-      }
-    }
+    writeField(i.U, _.valid, false.B, needCancel(i))
   }
 
   XSDebug(p"(ready, valid): ${io.enq.canAccept}, ${Binary(Cat(io.enq.req.map(_.valid)))}\n")
@@ -304,17 +284,11 @@ class VirtualLoadQueue(implicit p: Parameters)
 
     val need_rep = io.ldin(i).bits.rep_info.need_rep
     val need_valid = io.ldin(i).bits.updateAddrValid
-    when (io.ldin(i).valid) {
-      val hasExceptions = ExceptionNO.selectByFu(io.ldin(i).bits.uop.exceptionVec, LduCfg).asUInt.orR
-      updateSlot(loadWbIndex) { e =>
-        when (io.ldin(i).valid && !need_rep && need_valid && !io.ldin(i).bits.isvec) {
-          e.committed := true.B
-          //  Debug info
-          e.debug_mmio := io.ldin(i).bits.mmio
-          e.debug_paddr := io.ldin(i).bits.paddr
-        }
-      }
-    }
+    val wbEnable = io.ldin(i).valid && !need_rep && need_valid && !io.ldin(i).bits.isvec
+    writeField(loadWbIndex, _.committed, true.B, wbEnable)
+    //  Debug info
+    writeField(loadWbIndex, _.debug_mmio, io.ldin(i).bits.mmio, wbEnable)
+    writeField(loadWbIndex, _.debug_paddr, io.ldin(i).bits.paddr, wbEnable)
     XSInfo(io.ldin(i).valid && !need_rep && need_valid,
       "load hit write to lq idx %d pc 0x%x vaddr %x paddr %x mask %x forwardData %x forwardMask: %x mmio %x isvec %x\n",
       io.ldin(i).bits.uop.lqIdx.asUInt,
@@ -354,5 +328,7 @@ class VirtualLoadQueue(implicit p: Parameters)
   }
   // end
 
+  // Slots are written by absolute lqIdx; no RingQueue-managed enqueue is used.
+  enq(Seq(0.U.asTypeOf(new VirtualLoadQueuePayload)), Seq(false.B))
   emitRTL()
 }
