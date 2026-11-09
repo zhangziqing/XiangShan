@@ -27,8 +27,6 @@ abstract class RingQueue[T <: Data](
       RegInit(VecInit(initial))
     case None => Reg(Vec(entries, gen))
   }
-  private var modifyElement: T => Unit = _ => ()
-  private var emitted = false
 
   override protected final def read(index: Int): T = contents(index).readOnly
   override protected final def read(index: UInt): T = Mux1H(UIntToOHSeq(index, entries), contents.toSeq).readOnly
@@ -38,25 +36,15 @@ abstract class RingQueue[T <: Data](
 
   override protected final def foreach(read: T => Unit): Unit = contents.foreach(entry => read(entry.readOnly))
 
-  private def requireRegistrationScope(): Unit = {
-    require(!emitted, "modifications must be registered before emission")
-    require(when.cond.litOption.contains(BigInt(1)),
-      "register delayed Queue operations outside when with explicit enables")
-  }
+  override protected final def update(modify: T => Unit): Unit = contents.foreach(modify)
 
-  override protected final def update(modify: T => Unit): Unit = {
-    requireRegistrationScope()
-    modifyElement = compose(modifyElement, modify)
-  }
-
-  /** Register outside when; flush/recovery do not suppress indexed writes. */
+  /** Flush/recovery do not suppress indexed writes. */
   override protected final def write(index: UInt, data: T, enable: Bool): Unit =
     writeField(index, (entry: T) => entry, data, enable)
 
   override protected final def writeField[D <: Data](
     index: UInt, field: T => D, data: D, enable: Bool
   ): Unit = {
-    requireRegistrationScope()
     val selected = UIntToOHSeq(index, entries)
     update { entry =>
       when(enable && selected(physicalSlot(entry))) { field(entry) := data }
@@ -67,12 +55,6 @@ abstract class RingQueue[T <: Data](
     val result = WireDefault(false.B)
     foreach { entry => when(predicate(entry)) { result := true.B } }
     result
-  }
-
-  private def emitUpdates(): Unit = {
-    requireRegistrationScope()
-    emitted = true
-    contents.foreach(modifyElement)
   }
 
   /** Uses callback object identity, not payload equality. */
@@ -101,17 +83,8 @@ abstract class RingQueue[T <: Data](
     deqPtr := 0.U.asTypeOf(new QueuePtr)
   }
 
-  private var enqDefinition: Option[(Seq[T], Seq[Bool])] = None
-
-  /** Call once after registration, inside Module construction. */
-  final def emitRTL(): this.type = {
-    val (elements, accepted) = enqDefinition.getOrElse {
-      throw new IllegalArgumentException("enqueue must be registered before emission")
-    }
-    emitUpdates()
-    emitEnq(elements, accepted)
-    this
-  }
+  /** Compatibility alias; operations generate hardware when called. */
+  final def emitRTL(): this.type = this
 
   /** Default admission accepts the whole valid batch without dequeue credit. */
   override protected def enqGuard(elements: Seq[ValidIO[T]]): Seq[Bool] = {
@@ -126,14 +99,9 @@ abstract class RingQueue[T <: Data](
   }
 
   override protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
-    requireRegistrationScope()
     require(elements.nonEmpty, "enqueue needs at least one input")
     require(elements.length == accepted.length, "enqueue data and acceptance widths must match")
     require(elements.length <= numEnq, "enqueue exceeds the configured port count")
-    enqDefinition = Some((elements, accepted))
-  }
-
-  private def emitEnq(elements: Seq[T], accepted: Seq[Bool]): Unit = {
     when(!recover && !flush) {
       for (i <- elements.indices) {
         when(accepted(i)) {

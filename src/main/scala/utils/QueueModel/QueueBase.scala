@@ -40,7 +40,7 @@ abstract class QueueBase[T <: Data](val entries: Int)(
   /** Read-only traversal without implicit validity filtering. */
   protected def foreach(read: T => Unit): Unit
 
-  /** Register outside when; RHS reads old state and later enabled writes win per field. */
+  /** Apply in the current Chisel scope; RHS reads old state and later enabled writes win per field. */
   protected def update(modify: T => Unit): Unit
 
   /** Uses the same read-only, unfiltered observation contract as foreach. */
@@ -52,11 +52,11 @@ abstract class QueueBase[T <: Data](val entries: Int)(
   /** Gates consumption; reads remain visible. */
   protected def deqGuard(count: UInt): Bool
 
-  /** Later registrations can replace writes without revoking this call's result. */
+  /** Generate enqueue once per instance and return this call's acceptance. */
   protected def enq(elements: Seq[ValidIO[T]]): Seq[Bool]
 
-  /** Bypasses enqGuard. Accepted inputs pack in order and override ordinary writes.
-    * The last registration wins, including an all-false mask.
+  /** Bypasses enqGuard; accepted inputs pack from the old tail in port order.
+    * Call once per instance. Conflicting writes follow Chisel connection order.
     */
   protected def enq(elements: Seq[T], accepted: Seq[Bool]): Unit
 
