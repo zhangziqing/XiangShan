@@ -53,7 +53,7 @@ class TestableVirtualLoadQueue(implicit p: Parameters) extends VirtualLoadQueue 
   }
 }
 
-/** Verbatim legacy VirtualLoadQueue with the same test-only state exposure. */
+/** Legacy reference with test-only state exposure; see docs/queue-contract.md for reset normalization. */
 class TestableLegacyVirtualLoadQueue(implicit p: Parameters) extends LegacyVirtualLoadQueue {
   val dbg = IO(Output(new VLoadQueueDbg))
   dbg.allocated   := allocated
@@ -65,11 +65,11 @@ class TestableLegacyVirtualLoadQueue(implicit p: Parameters) extends LegacyVirtu
   dbg.debug_paddr := debug_paddr
 }
 
-/** Miter harness: production VirtualLoadQueue beside the verbatim legacy copy.
+/** Miter harness: production VirtualLoadQueue beside the independent legacy copy.
   *
-  * Field-by-field: public outputs plus the exposed internal state. Payload is
-  * compared only while either side marks the entry allocated, so unreset
-  * registers are never compared as zeros.
+  * Public outputs and reset fields are compared immediately. Unreset identity
+  * and completion fields are compared after their first defining write, including
+  * observations after invalidation and later reset.
   */
 class VLoadQueueMiterHarness(implicit p: Parameters) extends XSModule {
   val io = IO(new Bundle {
@@ -121,6 +121,8 @@ class VLoadQueueMiterHarness(implicit p: Parameters) extends XSModule {
 
   private val newQ = Module(new TestableVirtualLoadQueue)
   private val refQ = Module(new TestableLegacyVirtualLoadQueue)
+  // Preserve constant connections at the model substitution boundary.
+  dontTouch(newQ.io)
 
   private def driveRedirect(valid: Bool, robVal: UInt, robFlag: Bool): Redirect = {
     val r = Wire(new Redirect)
@@ -268,7 +270,7 @@ class VLoadQueueMiterHarness(implicit p: Parameters) extends XSModule {
 
 class VirtualLoadQueueSpec extends AnyFlatSpec with ChiselScalatestTester {
   private val base = new DefaultConfig
-  // Smallest legal depth so the caller miter (two full ownership tables plus the
+  // Small test depth so the caller miter (two full ownership tables plus the
   // legacy copy) stays fast; the real production class and all field ports are
   // kept and wrap/collision coverage is exercised more often.
   private val core = base(XSTileKey).head.copy(VirtualLoadQueueSize = 8)
