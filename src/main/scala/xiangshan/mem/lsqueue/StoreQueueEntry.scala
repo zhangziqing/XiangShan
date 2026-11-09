@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Per-entry StoreQueue metadata; physical identity is immutable.
+// Per-entry StoreQueue metadata.
 package xiangshan.mem
 
 import chisel3._
@@ -10,8 +10,8 @@ import xiangshan.backend.Bundles.DynInst
 
 /** Metadata retained by one StoreQueue element.
   *
-  * All fields are updated through the owning queue's absolute-slot indexed
-  * writes; no slot identity is stored in the payload.
+  * Dispatch allocation patches its own fields; later indexed writes and
+  * content-based updates follow source order. No slot identity is stored.
   */
 class StoreQueueEntry(implicit p: Parameters) extends XSBundle {
   val uop = new DynInst

@@ -23,7 +23,7 @@ import chisel3.util._
 import chisel3.experimental.BundleLiterals._
 import utility._
 import utils._
-import _root_.utils.QueueModel.StoreQueueRing
+import _root_.utils.QueueModel.{QueueRTL, RingQueue}
 import freechips.rocketchip.tile.HasFPUParameters
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -152,7 +152,12 @@ class GenerateInfoFromSBuffer extends Bundle{
 
 // Store Queue
 class StoreQueue(implicit p: Parameters)
-  extends StoreQueueRing[StoreQueueEntry](new StoreQueueEntry, p(XSCoreParamsKey).StoreQueueSize)(p)
+  extends RingQueue[StoreQueueEntry](
+    new StoreQueueEntry,
+    p(XSCoreParamsKey).StoreQueueSize,
+    p(XSCoreParamsKey).RenameWidth,
+    1
+  )(p, QueueRTL)
   with HasXSParameter
   with HasFPUParameters
   with HasDCacheParameters
@@ -361,11 +366,11 @@ class StoreQueue(implicit p: Parameters)
   val vecExceptionFlag = RegInit(0.U.asTypeOf(Valid(new DynInst)))
   val noPending = RegInit(true.B)
 
-  // Endpoint control is inherited from QueueBase; auxiliary cursors stay local.
-  val enqPtrExt = Wire(Vec(io.enq.req.length, new SqPtr))
-  for (i <- 0 until enqPtrExt.length) {
-    enqPtrExt(i) := (enqPtr + i.U).asTypeOf(new SqPtr)
-  }
+  // Endpoint control is inherited from QueueBase; auxiliary committed/data/ready
+  // cursors stay local. One SqPtr view serves external/helper type compatibility.
+  val enqPtrView = Wire(new SqPtr)
+  enqPtrView.flag := enqPtr.flag
+  enqPtrView.value := enqPtr.value
   val rdataPtrExt = RegInit(VecInit((0 until EnsbufferWidth).map(_.U.asTypeOf(new SqPtr))))
   val deqPtrExt = Wire(Vec(EnsbufferWidth, new SqPtr))
   for (i <- 0 until deqPtrExt.length) {
@@ -375,12 +380,12 @@ class StoreQueue(implicit p: Parameters)
   val addrReadyPtrExt = RegInit(0.U.asTypeOf(new SqPtr))
   val dataReadyPtrExt = RegInit(0.U.asTypeOf(new SqPtr))
 
-  val enqPtrValue = enqPtrExt(0).value
-  val deqPtrValue = deqPtrExt(0).value
+  val enqPtrValue = enqPtr.value
+  val deqPtrValue = deqPtr.value
   val cmtPtr = cmtPtrExt(0).value
   val rdPtr = rdataPtrExt(0).value
 
-  val validCount = distanceBetween(enqPtrExt(0), deqPtrExt(0))
+  val validCount = count
   val allowEnqueue = validCount <= (StoreQueueSize - LSQStEnqWidth).U
 
   val deqMask = UIntToMask(deqPtrValue, StoreQueueSize)
@@ -466,47 +471,46 @@ class StoreQueue(implicit p: Parameters)
   val validVStoreOffset = vStoreFlow.zip(io.enq.needAlloc).map{case (flow, needAllocItem) => Mux(needAllocItem, flow, 0.U)}
   val validVStoreOffsetRShift = 0.U +: validVStoreOffset.take(vStoreFlow.length - 1)
 
-  val enqLowBound = io.enq.req.map(_.bits.sqIdx)
-  val enqUpBound  = io.enq.req.map(x => x.bits.sqIdx + x.bits.numLsElem)
-  val enqCrossLoop = enqLowBound.zip(enqUpBound).map{case (low, up) => low.flag =/= up.flag}
-
-  for(i <- 0 until StoreQueueSize) {
-    val entryCanEnqSeq = (0 until io.enq.req.length).map { j =>
-      val entryHitBound = Mux(
-        enqCrossLoop(j),
-        enqLowBound(j).value <= i.U || i.U < enqUpBound(j).value,
-        enqLowBound(j).value <= i.U && i.U < enqUpBound(j).value
-      )
-      canEnqueue(j) && !enqCancel(j) && entryHitBound
+  /** Allocation patches only its fields; raw debug and memory attributes survive.
+    * Dispatch ranges use absolute slots and retain lowest-port overlap priority.
+    */
+  private def allocateDispatch(requests: Seq[ValidIO[DynInst]], canceled: Seq[Bool]): Unit = {
+    val lower = requests.map(_.bits.sqIdx)
+    val upper = requests.map(req => req.bits.sqIdx + req.bits.numLsElem)
+    for (i <- 0 until entries) {
+      val hits = requests.indices.map { j =>
+        val inRange = Mux(lower(j).flag =/= upper(j).flag,
+          lower(j).value <= i.U || i.U < upper(j).value,
+          lower(j).value <= i.U && i.U < upper(j).value)
+        requests(j).valid && !canceled(j) && inRange
+      }
+      val enabled = hits.reduce(_ || _)
+      val request = ParallelPriorityMux(hits, requests.map(_.bits))
+      val end = ParallelPriorityMux(hits, upper)
+      val lastFlow = (if (i + 1 == entries) 0.U else (i + 1).U) === end.value
+      writeField(i.U, _.uop, request, enabled)
+      writeField(i.U, _.vecLastFlow, lastFlow && request.lastUop, enabled)
+      writeField(i.U, _.allocated, true.B, enabled)
+      writeField(i.U, _.completed, false.B, enabled)
+      writeField(i.U, _.datavalid, false.B, enabled)
+      writeField(i.U, _.addrvalid, false.B, enabled)
+      writeField(i.U, _.unaligned, false.B, enabled)
+      writeField(i.U, _.cross16Byte, false.B, enabled)
+      writeField(i.U, _.committed, false.B, enabled)
+      writeField(i.U, _.pending, false.B, enabled)
+      writeField(i.U, _.prefetch, false.B, enabled)
+      writeField(i.U, _.nc, false.B, enabled)
+      writeField(i.U, _.mmio, false.B, enabled)
+      writeField(i.U, _.isVec, FuType.isVStore(request.fuType), enabled)
+      writeField(i.U, _.vecMbCommit, false.B, enabled)
+      writeField(i.U, _.hasException, false.B, enabled)
+      writeField(i.U, _.waitStoreS2, true.B, enabled)
     }
-
-    val entryCanEnq = entryCanEnqSeq.reduce(_ || _)
-    val selectBits = ParallelPriorityMux(entryCanEnqSeq, io.enq.req.map(_.bits))
-    val selectUpBound = ParallelPriorityMux(entryCanEnqSeq, enqUpBound)
-    writeField(i.U, _.uop, selectBits, entryCanEnq)
-    writeField(i.U, _.vecLastFlow, (if (i + 1 == StoreQueueSize)
-      Mux(0.U === selectUpBound.value, selectBits.lastUop, false.B)
-    else
-      Mux((i + 1).U === selectUpBound.value, selectBits.lastUop, false.B)), entryCanEnq)
-    writeField(i.U, _.allocated, true.B, entryCanEnq)
-    writeField(i.U, _.completed, false.B, entryCanEnq)
-    writeField(i.U, _.datavalid, false.B, entryCanEnq)
-    writeField(i.U, _.addrvalid, false.B, entryCanEnq)
-    writeField(i.U, _.unaligned, false.B, entryCanEnq)
-    writeField(i.U, _.cross16Byte, false.B, entryCanEnq)
-    writeField(i.U, _.committed, false.B, entryCanEnq)
-    writeField(i.U, _.pending, false.B, entryCanEnq)
-    writeField(i.U, _.prefetch, false.B, entryCanEnq)
-    writeField(i.U, _.nc, false.B, entryCanEnq)
-    writeField(i.U, _.mmio, false.B, entryCanEnq)
-    writeField(i.U, _.isVec, FuType.isVStore(selectBits.fuType), entryCanEnq)
-    writeField(i.U, _.vecMbCommit, false.B, entryCanEnq)
-    writeField(i.U, _.hasException, false.B, entryCanEnq)
-    writeField(i.U, _.waitStoreS2, true.B, entryCanEnq)
   }
+  allocateDispatch(io.enq.req.toSeq, enqCancel)
 
   for (i <- 0 until io.enq.req.length) {
-    val sqIdx = enqPtrExt(0) + validVStoreOffsetRShift.take(i + 1).reduce(_ + _)
+    val sqIdx = enqPtrView + validVStoreOffsetRShift.take(i + 1).reduce(_ + _)
     val index = io.enq.req(i).bits.sqIdx
     XSError(canEnqueue(i) && !enqCancel(i) && (!io.enq.canAccept || !io.enq.lqCanAccept), s"must accept $i\n")
     XSError(canEnqueue(i) && !enqCancel(i) && index.value =/= sqIdx.value, s"must be the same entry $i\n")
@@ -524,7 +528,7 @@ class StoreQueue(implicit p: Parameters)
   val addrReadyLookupVec = (0 until IssuePtrMoveStride).map(addrReadyPtrExt + _.U)
   val addrReadyLookup = addrReadyLookupVec.map(ptr => allocated(ptr.value) &&
    (mmio(ptr.value) || addrvalid(ptr.value) || vecMbCommit(ptr.value))
-    && ptr =/= enqPtrExt(0))
+    && ptr =/= enqPtrView)
   val nextAddrReadyPtr = addrReadyPtrExt + PriorityEncoder(VecInit(addrReadyLookup.map(!_) :+ true.B))
   addrReadyPtrExt := nextAddrReadyPtr
 
@@ -550,7 +554,7 @@ class StoreQueue(implicit p: Parameters)
     allocated(ptr.value) &&
     (addrvalid(ptr.value) && (mmio(ptr.value) || datavalid(ptr.value)) || vecMbCommit(ptr.value)) &&
     !unaligned(ptr.value) &&
-    ptr =/= enqPtrExt(0)
+    ptr =/= enqPtrView
   )
   val nextDataReadyPtr = dataReadyPtrExt + PriorityEncoder(VecInit(dataReadyLookup.map(!_) :+ true.B))
   dataReadyPtrExt := nextDataReadyPtr
@@ -582,7 +586,7 @@ class StoreQueue(implicit p: Parameters)
   }
 
   io.stDataReadySqPtr := dataReadyPtrExt
-  io.stIssuePtr := enqPtrExt(0)
+  io.stIssuePtr := enqPtrView
   io.sqDeqPtr := deqPtrExt(0)
 
   /**
@@ -834,8 +838,8 @@ class StoreQueue(implicit p: Parameters)
     // check whether false fail
     // check flag
     val s2_differentFlag = RegNext(differentFlag)
-    val s2_enqPtrExt = RegNext(enqPtrExt(0))
-    val s2_deqPtrExt = RegNext(deqPtrExt(0))
+    val s2_enqPtr = RegNext(enqPtrView)
+    val s2_deqPtr = RegNext(deqPtrExt(0))
 
     // addr invalid sq index
     // make chisel happy
@@ -873,7 +877,7 @@ class StoreQueue(implicit p: Parameters)
     when (RegEnable(io.forward(i).uop.loadWaitStrict, io.forward(i).valid)) {
       io.forward(i).addrInvalidSqIdx := RegEnable((io.forward(i).uop.sqIdx - 1.U), io.forward(i).valid)
     } .elsewhen (addrInvalidFlag) {
-      io.forward(i).addrInvalidSqIdx.flag := Mux(!s2_differentFlag || addrInvalidSqIdx >= s2_deqPtrExt.value, s2_deqPtrExt.flag, s2_enqPtrExt.flag)
+      io.forward(i).addrInvalidSqIdx.flag := Mux(!s2_differentFlag || addrInvalidSqIdx >= s2_deqPtr.value, s2_deqPtr.flag, s2_enqPtr.flag)
       io.forward(i).addrInvalidSqIdx.value := addrInvalidSqIdx
     } .otherwise {
       // may be store inst has been written to sbuffer already.
@@ -892,7 +896,7 @@ class StoreQueue(implicit p: Parameters)
     val dataInvalidSqIdx = Mux(dataInvalidMask2Reg.orR, dataInvalidSqIdx2, dataInvalidSqIdx1)
 
     when (dataInvalidFlag) {
-      io.forward(i).dataInvalidSqIdx.flag := Mux(!s2_differentFlag || dataInvalidSqIdx >= s2_deqPtrExt.value, s2_deqPtrExt.flag, s2_enqPtrExt.flag)
+      io.forward(i).dataInvalidSqIdx.flag := Mux(!s2_differentFlag || dataInvalidSqIdx >= s2_deqPtr.value, s2_deqPtr.flag, s2_enqPtr.flag)
       io.forward(i).dataInvalidSqIdx.value := dataInvalidSqIdx
     } .otherwise {
       // may be store inst has been written to sbuffer already.
@@ -1531,17 +1535,14 @@ class StoreQueue(implicit p: Parameters)
   io.exceptionAddr.isForVSnonLeafPTE := exceptionBuffer.io.exceptionAddr.isForVSnonLeafPTE
 
   // vector commit or replay from
-  val vecCommittmp = Wire(Vec(StoreQueueSize, Vec(VecStorePipelineWidth, Bool())))
-  val vecCommit = Wire(Vec(StoreQueueSize, Bool()))
-  for (i <- 0 until StoreQueueSize) {
-    val fbk = io.vecFeedback
-    for (j <- 0 until VecStorePipelineWidth) {
-      vecCommittmp(i)(j) := fbk(j).valid && (fbk(j).bits.isCommit || fbk(j).bits.isFlush) &&
-        uop(i).robIdx === fbk(j).bits.robidx && uop(i).uopIdx === fbk(j).bits.uopidx && allocated(i)
+  update { entry =>
+    val matchingFeedback = io.vecFeedback.take(VecStorePipelineWidth).map(fbk =>
+      fbk.valid && (fbk.bits.isCommit || fbk.bits.isFlush) &&
+        entry.uop.robIdx === fbk.bits.robidx && entry.uop.uopIdx === fbk.bits.uopidx
+    ).reduce(_ || _)
+    when(entry.allocated && matchingFeedback) {
+      entry.vecMbCommit := true.B
     }
-    vecCommit(i) := vecCommittmp(i).reduce(_ || _)
-
-    writeField(i.U, _.vecMbCommit, true.B, vecCommit(i))
   }
 
   // For vector, when there is a store across pages with the same uop in storeMisalignBuffer, storequeue needs to mark this item as committed.
@@ -1550,14 +1551,18 @@ class StoreQueue(implicit p: Parameters)
 
   // misprediction recovery / exception redirect
   // invalidate sq term using robIdx
-  for (i <- 0 until StoreQueueSize) {
-    needCancel(i) := allocated(i) && !committed(i) && Mux(
+  def needsCancel(entry: StoreQueueEntry): Bool =
+    entry.allocated && !entry.committed && Mux(
         vecExceptionFlag.valid,
-        isAfter(uop(i).robIdx, io.brqRedirect.bits.robIdx) && io.brqRedirect.valid,
-        uop(i).robIdx.needFlush(io.brqRedirect)
+        isAfter(entry.uop.robIdx, io.brqRedirect.bits.robIdx) && io.brqRedirect.valid,
+        entry.uop.robIdx.needFlush(io.brqRedirect)
       )
-    writeField(i.U, _.allocated, false.B, needCancel(i))
-    writeField(i.U, _.completed, false.B, needCancel(i))
+  needCancel := VecInit((0 until entries).map(i => needsCancel(read(i))))
+  update { entry =>
+    when(needsCancel(entry)) {
+      entry.allocated := false.B
+      entry.completed := false.B
+    }
   }
 
  /**
@@ -1578,12 +1583,11 @@ class StoreQueue(implicit p: Parameters)
   val lastlastCycleRedirect=RegNext(lastCycleRedirect)// 2 cycle after redirect
   val redirectCancelCount = RegEnable(lastCycleCancelCount + lastEnqCancel, 0.U, lastCycleRedirect) // 2 cycle after redirect
 
-  // Rollback installs an exclusive tail by subtraction. Normal allocation keeps
-  // advanceEnq: dispatch may fill multiple absolute slots from vector flow counts
-  // with partial-field writes, which packed enqueue cannot express.
+  // Canceled flows reserve tail space without payload writes. Rollback changes
+  // only the tail and must not suppress same-cycle dispatch allocation.
+  advanceEnq(enqNumber)
   recover := lastlastCycleRedirect
   recoverPtr := enqPtr - redirectCancelCount
-  advanceEnq(enqNumber)
   assert(!(lastCycleRedirect && enqNumber =/= 0.U))
   // Retirement consumes metadata in this module and reads the data banks through
   // the separate rdata cursor; the normal ring dequeue supplies the same guarded
@@ -1608,8 +1612,8 @@ class StoreQueue(implicit p: Parameters)
   // When sbuffer need to check if it is empty, the pipeline is blocked, which means delay io.sqempty
   // for 1 cycle will also promise that sq is empty in that cycle
   io.sqEmpty := RegNext(
-    enqPtrExt(0).value === deqPtrExt(0).value &&
-    enqPtrExt(0).flag === deqPtrExt(0).flag
+    enqPtrValue === deqPtrValue &&
+    enqPtrView.flag === deqPtrExt(0).flag
   )
   // perf counter
   QueuePerf(StoreQueueSize, validCount, !allowEnqueue)
@@ -1620,11 +1624,11 @@ class StoreQueue(implicit p: Parameters)
   XSPerfAccumulate("mmioCnt", mmioDoReq)
   XSPerfAccumulate("mmio_wb_success", io.mmioStout.fire || io.vecmmioStout.fire)
   XSPerfAccumulate("mmio_wb_blocked", (io.mmioStout.valid && !io.mmioStout.ready) || (io.vecmmioStout.valid && !io.vecmmioStout.ready))
-  XSPerfAccumulate("validEntryCnt", distanceBetween(enqPtrExt(0), deqPtrExt(0)))
+  XSPerfAccumulate("validEntryCnt", distanceBetween(enqPtrView, deqPtrExt(0)))
   XSPerfAccumulate("cmtEntryCnt", distanceBetween(cmtPtrExt(0), deqPtrExt(0)))
-  XSPerfAccumulate("nCmtEntryCnt", distanceBetween(enqPtrExt(0), cmtPtrExt(0)))
+  XSPerfAccumulate("nCmtEntryCnt", distanceBetween(enqPtrView, cmtPtrExt(0)))
 
-  val perfValidCount = distanceBetween(enqPtrExt(0), deqPtrExt(0))
+  val perfValidCount = distanceBetween(enqPtrView, deqPtrExt(0))
   val perfEvents = Seq(
     ("mmioCycle      ", mmioState =/= s_idle),
     ("mmioCnt        ", mmioDoReq),
@@ -1638,7 +1642,7 @@ class StoreQueue(implicit p: Parameters)
   generatePerfEvent()
 
   // debug info
-  XSDebug("enqPtrExt %d:%d deqPtrExt %d:%d\n", enqPtrExt(0).flag, enqPtrValue, deqPtrExt(0).flag, deqPtrValue)
+  XSDebug("enqPtrExt %d:%d deqPtrExt %d:%d\n", enqPtrView.flag, enqPtrValue, deqPtrExt(0).flag, deqPtrValue)
 
   def PrintFlag(flag: Bool, name: String): Unit = {
     XSDebug(false, flag, name) // when(flag)
