@@ -18,7 +18,7 @@ object ContractElab extends App {
       here(DebugOptionsKey).EnableXMR)
   })
   (new circt.stage.ChiselStage).execute(
-    Array("--target", "chirrtl", "--target-dir", args(0)),
+    Array("--target", args.lift(3).getOrElse("chirrtl"), "--target-dir", args(0)),
     Seq(ChiselGeneratorAnnotation(() =>
       if (args.lift(2).contains("async")) new VLoadQueueResetHarness
       else new VLoadQueueMiterHarness)))
