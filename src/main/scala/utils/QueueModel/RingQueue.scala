@@ -3,6 +3,7 @@ package utils.QueueModel
 
 import chisel3._
 import chisel3.Data._
+import chisel3.experimental.annotate
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.OneHot.UIntToOHSeq
@@ -27,6 +28,9 @@ abstract class RingQueue[T <: Data](
       RegInit(VecInit(initial))
     case None => Reg(Vec(entries, gen))
   }
+
+  annotate(this)(Seq(QueueContractAnnotation(this.toNamed, entries, numEnq, numDeq,
+    Seq("contents", "enqPtr", "deqPtr"))))
 
   override protected final def read(index: Int): T = contents(index).readOnly
   override protected final def read(index: UInt): T = Mux1H(UIntToOHSeq(index, entries), contents.toSeq).readOnly
@@ -111,6 +115,30 @@ abstract class RingQueue[T <: Data](
       }
     }
     advanceEnq(PopCount(accepted))
+  }
+
+  /** Reservation enqueue: accepted payload fills absolute circular ranges, with
+    * lowest-port priority on overlap. Reservation is independent of acceptance;
+    * recovery replaces the tail step but does not suppress these payload writes.
+    * The guard owns range admission; flush still suppresses payload writes.
+    */
+  protected final def enq(
+    elements: Seq[ValidIO[T]], ranges: Seq[(QueuePtr, UInt)], reserved: UInt
+  ): Seq[Bool] = {
+    require(elements.nonEmpty && elements.length <= numEnq)
+    require(elements.length == ranges.length)
+    val accepted = enqGuard(elements)
+    val bounds = ranges.map { case (start, length) => (start, start + length) }
+    for (slot <- 0 until entries) {
+      val hits = bounds.zip(accepted).map { case ((start, end), accept) =>
+        accept && Mux(start.flag =/= end.flag,
+          start.value <= slot.U || slot.U < end.value,
+          start.value <= slot.U && slot.U < end.value)
+      }
+      when(!flush && hits.reduce(_ || _)) { contents(slot) := PriorityMux(hits, elements.map(_.bits)) }
+    }
+    advanceEnq(reserved)
+    accepted
   }
 
   /** No default occupancy check. */

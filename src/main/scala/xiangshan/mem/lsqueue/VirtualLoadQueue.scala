@@ -49,7 +49,7 @@ class VirtualLoadQueue(implicit p: Parameters)
   extends RingQueue[VirtualLoadQueuePayload](
     new VirtualLoadQueuePayload,
     p(XSCoreParamsKey).VirtualLoadQueueSize,
-    p(XSCoreParamsKey).RenameWidth, 1
+    p(XSCoreParamsKey).RenameWidth, p(XSCoreParamsKey).CommitWidth
   )(p, QueueRTL)
   with HasDCacheParameters
   with HasCircularQueuePtrHelper
@@ -89,25 +89,6 @@ class VirtualLoadQueue(implicit p: Parameters)
       _.valid -> false.B,
       _.isvec -> false.B
     )))
-
-  // Read-only legacy views over the inherited payload storage.
-  val allocated = Wire(Vec(VirtualLoadQueueSize, Bool()))
-  val robIdx = Wire(Vec(VirtualLoadQueueSize, new RobPtr))
-  val uopIdx = Wire(Vec(VirtualLoadQueueSize, UopIdx()))
-  val isvec = Wire(Vec(VirtualLoadQueueSize, Bool()))
-  val committed = Wire(Vec(VirtualLoadQueueSize, Bool()))
-  val debug_mmio = Wire(Vec(VirtualLoadQueueSize, Bool()))
-  val debug_paddr = Wire(Vec(VirtualLoadQueueSize, UInt(PAddrBits.W)))
-  for (i <- 0 until VirtualLoadQueueSize) {
-    val e = read(i)
-    allocated(i) := e.valid
-    robIdx(i) := e.robIdx
-    uopIdx(i) := e.uopIdx
-    isvec(i) := e.isvec
-    committed(i) := e.committed
-    debug_mmio(i) := e.debug_mmio
-    debug_paddr(i) := e.debug_paddr
-  }
 
   // Single LqPtr views for external responses and the redirect/clamp policy.
   val enqPtrView = Wire(new LqPtr)
@@ -153,22 +134,23 @@ class VirtualLoadQueue(implicit p: Parameters)
   val DeqPtrMoveStride = CommitWidth
   require(DeqPtrMoveStride == CommitWidth, "DeqPtrMoveStride must be equal to CommitWidth!")
   val deqLookupVec = VecInit((0 until DeqPtrMoveStride).map(deqPtrView + _.U))
-  val deqLookup = VecInit(deqLookupVec.map(ptr => allocated(ptr.value) && committed(ptr.value) && ptr =/= enqPtrView))
-  val deqInSameRedirectCycle = VecInit(deqLookupVec.map(ptr => needCancel(ptr.value)))
+  val lastCommitCount = Wire(UInt(log2Ceil(CommitWidth + 1).W))
+  val headEntries = deq(lastCommitCount)
+  val deqLookup = VecInit(headEntries.zip(deqLookupVec).map { case (entry, ptr) =>
+    entry.valid && entry.committed && ptr =/= enqPtrView
+  })
+  val deqInSameRedirectCycle = VecInit(headEntries.map(needsCancel))
   // make chisel happy
   val deqCountMask = Wire(UInt(DeqPtrMoveStride.W))
   deqCountMask := deqLookup.asUInt & (~deqInSameRedirectCycle.asUInt).asUInt
   val commitCount = PopCount(PriorityEncoderOH(~deqCountMask) - 1.U)
-  val lastCommitCount = GatedRegNext(commitCount)
+  lastCommitCount := GatedRegNext(commitCount)
 
   // update deqPtr
   // lastCommitCount was registered from cycle 1; deq consumes it at this edge.
   // deqPtrNext remains the next head used by the tail clamp.
   deqPtrNext := deqPtrView + lastCommitCount
-  deq(lastCommitCount)
 
-  // Reservations include canceled dispatch flows; payload acceptance does not.
-  advanceEnq(enqNumber)
   val naturalNext = Wire(new LqPtr)
   when (lastLastCycleRedirect.valid) {
     naturalNext := enqPtrView - redirectCancelCount
@@ -185,8 +167,8 @@ class VirtualLoadQueue(implicit p: Parameters)
   io.ldWbPtr := deqPtrView
   io.lqEmpty := RegNext(validCount === 0.U)
 
-  io.lqDeqRobIdx := robIdx(deqPtrView.value)
-  io.lqDeqUopIdx := uopIdx(deqPtrView.value)
+  io.lqDeqRobIdx := headEntries.head.robIdx
+  io.lqDeqUopIdx := headEntries.head.uopIdx
 
   /**
    * Enqueue at dispatch
@@ -196,32 +178,28 @@ class VirtualLoadQueue(implicit p: Parameters)
    */
   io.enq.canAccept := allowEnqueue
 
-  /** Absolute dispatch ranges write payload independently of tail reservation.
-    * Overlapping ranges retain the original lowest-port priority.
-    */
-  private def allocateDispatch(requests: Seq[ValidIO[DynInst]], canceled: Seq[Bool]): Unit = {
-    val lower = requests.map(_.bits.lqIdx)
-    val upper = requests.map(req => req.bits.lqIdx + req.bits.numLsElem)
-    for (i <- 0 until entries) {
-      val hits = requests.indices.map { j =>
-        val inRange = Mux(lower(j).flag =/= upper(j).flag,
-          lower(j).value <= i.U || i.U < upper(j).value,
-          lower(j).value <= i.U && i.U < upper(j).value)
-        requests(j).valid && !canceled(j) && inRange
-      }
-      val request = ParallelPriorityMux(hits, requests.map(_.bits))
-      val payload = Wire(new VirtualLoadQueuePayload)
-      payload.valid := true.B
-      payload.robIdx := request.robIdx
-      payload.uopIdx := request.uopIdx
-      payload.isvec := FuType.isVLoad(request.fuType)
-      payload.committed := false.B
-      payload.debug_mmio := false.B
-      payload.debug_paddr := 0.U
-      write(i.U, payload, hits.reduce(_ || _))
-    }
+  override protected def enqGuard(elements: Seq[ValidIO[VirtualLoadQueuePayload]]): Seq[Bool] =
+    elements.map(_.valid)
+
+  val dispatch = io.enq.req.zip(enqCancel).map { case (req, canceled) =>
+    val element = Wire(Valid(new VirtualLoadQueuePayload))
+    element.valid := req.valid && !canceled
+    element.bits.valid := true.B
+    element.bits.robIdx := req.bits.robIdx
+    element.bits.uopIdx := req.bits.uopIdx
+    element.bits.isvec := FuType.isVLoad(req.bits.fuType)
+    element.bits.committed := false.B
+    element.bits.debug_mmio := false.B
+    element.bits.debug_paddr := 0.U
+    element
   }
-  allocateDispatch(io.enq.req.toSeq, enqCancel)
+  val dispatchRanges = io.enq.req.map { req =>
+    val start = Wire(new QueuePtr)
+    start.flag := req.bits.lqIdx.flag
+    start.value := req.bits.lqIdx.value
+    (start, req.bits.numLsElem)
+  }
+  enq(dispatch.toSeq, dispatchRanges.toSeq, enqNumber)
 
   for (i <- 0 until io.enq.req.length) {
     val lqIdx = enqPtrView + validVLoadOffsetRShift.take(i + 1).reduce(_ + _)
@@ -239,7 +217,7 @@ class VirtualLoadQueue(implicit p: Parameters)
   (0 until DeqPtrMoveStride).map(i => {
     val slot = (deqPtrView + i.U).value
     writeField(slot, _.valid, false.B, commitCount > i.U)
-    XSError(commitCount > i.U && !allocated(slot), s"why commit invalid entry $i?\n")
+    XSError(commitCount > i.U && !headEntries(i).valid, s"why commit invalid entry $i?\n")
   })
 
   // vector commit or replay
@@ -295,7 +273,10 @@ class VirtualLoadQueue(implicit p: Parameters)
 
   //  perf counter
   QueuePerf(VirtualLoadQueueSize, validCount, !allowEnqueue)
-  val vecValidVec = WireInit(VecInit((0 until VirtualLoadQueueSize).map(i => allocated(i) && isvec(i))))
+  val vecValidVec = VecInit((0 until entries).map { i =>
+    val entry = read(i)
+    entry.valid && entry.isvec
+  })
   QueuePerf(VirtualLoadQueueSize, PopCount(vecValidVec), !allowEnqueue)
   io.lqFull := !allowEnqueue
 
@@ -310,10 +291,10 @@ class VirtualLoadQueue(implicit p: Parameters)
     XSDebug(false, !flag, " ") // otherwise
   }
 
-  for (i <- 0 until VirtualLoadQueueSize) {
-    PrintFlag(allocated(i), "a")
-    PrintFlag(allocated(i) && committed(i), "c")
-    PrintFlag(allocated(i) && isvec(i), "v")
+  foreach { entry =>
+    PrintFlag(entry.valid, "a")
+    PrintFlag(entry.valid && entry.committed, "c")
+    PrintFlag(entry.valid && entry.isvec, "v")
     XSDebug(false, true.B, "\n")
   }
   // end
