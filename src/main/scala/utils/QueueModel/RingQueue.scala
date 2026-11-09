@@ -3,7 +3,6 @@ package utils.QueueModel
 
 import chisel3._
 import chisel3.Data._
-import chisel3.experimental.annotate
 import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import utility.OneHot.UIntToOHSeq
@@ -28,9 +27,6 @@ abstract class RingQueue[T <: Data](
       RegInit(VecInit(initial))
     case None => Reg(Vec(entries, gen))
   }
-
-  annotate(this)(Seq(QueueContractAnnotation(this.toNamed, entries, numEnq, numDeq,
-    Seq("contents", "enqPtr", "deqPtr"))))
 
   override protected final def read(index: Int): T = contents(index).readOnly
   override protected final def read(index: UInt): T = Mux1H(UIntToOHSeq(index, entries), contents.toSeq).readOnly
