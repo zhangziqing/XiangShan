@@ -41,10 +41,9 @@ class VirtualLoadQueue(implicit p: Parameters)
   extends RingQueue[VirtualLoadQueuePayload](
     new VirtualLoadQueuePayload,
     p(XSCoreParamsKey).VirtualLoadQueueSize,
-    p(XSCoreParamsKey).RenameWidth,
+    p(XSCoreParamsKey).VirtualLoadQueueSize,
     p(XSCoreParamsKey).CommitWidth
   )(p, QueueRTL)
-  with HasCircularQueuePtrHelper
   with HasPerfEvents
   with HasVLSUParameters {
   val io = IO(new Bundle() {
@@ -75,9 +74,11 @@ class VirtualLoadQueue(implicit p: Parameters)
       _.isvec -> false.B
     )))
 
-  val validCount = count
-  val allowEnqueue = validCount <= (VirtualLoadQueueSize - LSQLdEnqWidth).U
-  val canEnqueue = io.enq.req.map(_.valid)
+  // Dispatch has already admitted these reservations, including cancelled flows.
+  override protected def enqGuard(elements: Seq[ValidIO[VirtualLoadQueuePayload]]): Seq[Bool] =
+    elements.map(element => element.valid && !recover && !flush)
+
+  val allowEnqueue = count <= (VirtualLoadQueueSize - LSQLdEnqWidth).U
   val vLoadFlow = io.enq.req.map(_.bits.numLsElem.asTypeOf(UInt(elemIdxBits.W)))
 
   val lastCycleRedirect = RegNext(io.redirect)
@@ -90,8 +91,8 @@ class VirtualLoadQueue(implicit p: Parameters)
     needsCancel(read(i))
   })
   val lastNeedCancel = GatedValidRegNext(needCancel)
-  val enqCancel = canEnqueue.zip(io.enq.req).map { case (valid, request) =>
-    valid && request.bits.robIdx.needFlush(io.redirect)
+  val enqCancel = io.enq.req.map { request =>
+    request.valid && request.bits.robIdx.needFlush(io.redirect)
   }
   val enqCancelNum = enqCancel.zip(vLoadFlow).map { case (cancel, flow) =>
     Mux(cancel, flow, 0.U)
@@ -104,26 +105,23 @@ class VirtualLoadQueue(implicit p: Parameters)
     lastCycleRedirect.valid
   )
 
-  val validVLoadFlow = vLoadFlow.zipWithIndex.map { case (flow, index) =>
-    Mux(canEnqueue(index), flow, 0.U)
+  val validVLoadFlow = vLoadFlow.zip(io.enq.req).map { case (flow, request) =>
+    Mux(request.valid, flow, 0.U)
   }
   val validVLoadOffset = vLoadFlow.zip(io.enq.needAlloc).map { case (flow, needAlloc) =>
     Mux(needAlloc, flow, 0.U)
   }
-  val validVLoadOffsetRShift = 0.U +: validVLoadOffset.take(validVLoadFlow.length - 1)
   val enqNumber = validVLoadFlow.reduce(_ + _)
 
-  val deqLookupVec = VecInit((0 until CommitWidth).map(offset => deqPtr + offset.U))
-  val deqCountMask = Wire(UInt(CommitWidth.W))
   val commitCount = Wire(UInt(log2Ceil(CommitWidth + 1).W))
   // Invalidation precedes the corresponding head advance by one cycle.
   val lastCommitCount = GatedRegNext(commitCount)
   val headEntries = deq(lastCommitCount, (0 until CommitWidth).map(_.U))
-  val deqLookup = VecInit(headEntries.zip(deqLookupVec).map { case (entry, ptr) =>
-    entry.valid && entry.committed && ptr =/= enqPtr
+  val deqLookup = VecInit(headEntries.zipWithIndex.map { case (entry, offset) =>
+    entry.valid && entry.committed && (deqPtr + offset.U) =/= enqPtr
   })
   val deqInSameRedirectCycle = VecInit(headEntries.map(needsCancel))
-  deqCountMask := deqLookup.asUInt & (~deqInSameRedirectCycle.asUInt).asUInt
+  val deqCountMask = deqLookup.asUInt & ~deqInSameRedirectCycle.asUInt
   commitCount := PopCount(PriorityEncoderOH(~deqCountMask) - 1.U)
 
   val deqPtrAfterCommit = deqPtr + lastCommitCount
@@ -137,9 +135,6 @@ class VirtualLoadQueue(implicit p: Parameters)
   recover := lastLastCycleRedirect.valid || clampTail
   recoverPtr.flag := Mux(clampTail, deqPtrAfterCommit.flag, naturalTail.flag)
   recoverPtr.value := Mux(clampTail, deqPtrAfterCommit.value, naturalTail.value)
-  // Cancelled flows still reserve slots; payload writes retain their supplied ranges.
-  advanceEnq(enqNumber)
-
   assert(!(lastCycleRedirect.valid && enqNumber =/= 0.U))
 
   io.enq.canAccept := allowEnqueue
@@ -147,10 +142,35 @@ class VirtualLoadQueue(implicit p: Parameters)
   io.lqCancelCnt := redirectCancelCount
   io.ldWbPtr.flag := deqPtr.flag
   io.ldWbPtr.value := deqPtr.value
-  io.lqEmpty := RegNext(validCount === 0.U)
+  io.lqEmpty := RegNext(empty)
   io.lqDeqRobIdx := headEntries.head.robIdx
   io.lqDeqUopIdx := headEntries.head.uopIdx
 
+  val enqPayloads = io.enq.req.map { request =>
+    val entry = Wire(new VirtualLoadQueuePayload)
+    entry.valid := true.B
+    entry.robIdx := request.bits.robIdx
+    entry.uopIdx := request.bits.uopIdx
+    entry.isvec := FuType.isVLoad(request.bits.fuType)
+    entry.committed := false.B
+    entry
+  }
+  val enqFlowOffsets = validVLoadFlow.scanLeft(0.U)(_ + _)
+  val enqFlows = (0 until entries).map { flow =>
+    val matches = io.enq.req.indices.map { i =>
+      io.enq.req(i).valid && !enqCancel(i) &&
+        enqFlowOffsets(i) <= flow.U && flow.U < enqFlowOffsets(i + 1)
+    }
+    val reservation = Wire(Valid(new VirtualLoadQueuePayload))
+    val slot = (enqPtr + flow.U).value
+    reservation.valid := flow.U < enqNumber
+    // Cancelled flows advance the tail without replacing the slot's contents.
+    reservation.bits := Mux(matches.reduce(_ || _), ParallelPriorityMux(matches, enqPayloads), read(slot))
+    reservation
+  }
+  enq(enqFlows)
+
+  // Recovery suppresses FIFO enqueue, but in-flight dispatch writes still complete.
   val enqLowBound = io.enq.req.map(_.bits.lqIdx)
   val enqUpBound = io.enq.req.map(request => request.bits.lqIdx + request.bits.numLsElem)
   val enqCrossLoop = enqLowBound.zip(enqUpBound).map { case (low, up) =>
@@ -164,28 +184,22 @@ class VirtualLoadQueue(implicit p: Parameters)
         enqLowBound(j).value <= i.U || i.U < enqUpBound(j).value,
         enqLowBound(j).value <= i.U && i.U < enqUpBound(j).value
       )
-      canEnqueue(j) && !enqCancel(j) && entryHitBound
+      io.enq.req(j).valid && !enqCancel(j) && entryHitBound
     }
     val entryCanEnq = entryCanEnqSeq.reduce(_ || _)
-    val selected = ParallelPriorityMux(entryCanEnqSeq, io.enq.req.map(_.bits))
-    val entry = Wire(new VirtualLoadQueuePayload)
-    entry.valid := true.B
-    entry.robIdx := selected.robIdx
-    entry.uopIdx := selected.uopIdx
-    entry.isvec := FuType.isVLoad(selected.fuType)
-    entry.committed := false.B
-    write(i.U, entry, entryCanEnq)
+    val entry = ParallelPriorityMux(entryCanEnqSeq, enqPayloads)
+    write(i.U, entry, recover && entryCanEnq)
   }
 
   for (i <- io.enq.req.indices) {
-    val responsePtr = enqPtr + validVLoadOffsetRShift.take(i + 1).reduce(_ + _)
+    val responsePtr = enqPtr + validVLoadOffset.take(i).foldLeft(0.U)(_ + _)
     val index = io.enq.req(i).bits.lqIdx
     XSError(
-      canEnqueue(i) && !enqCancel(i) && (!io.enq.canAccept || !io.enq.sqCanAccept),
+      io.enq.req(i).valid && !enqCancel(i) && (!io.enq.canAccept || !io.enq.sqCanAccept),
       s"must accept $i\n"
     )
     XSError(
-      canEnqueue(i) && !enqCancel(i) && index.value =/= responsePtr.value,
+      io.enq.req(i).valid && !enqCancel(i) && index.value =/= responsePtr.value,
       s"must be the same entry $i\n"
     )
     io.enq.resp(i).flag := responsePtr.flag
@@ -199,18 +213,17 @@ class VirtualLoadQueue(implicit p: Parameters)
     XSError(commitEnable && !headEntries(i).valid, s"why commit invalid entry $i?\n")
   }
 
-  val vecLdCommit = Wire(Vec(VirtualLoadQueueSize, Bool()))
-  for (i <- 0 until VirtualLoadQueueSize) {
-    val entry = read(i)
+  update { entry =>
     val matches = io.vecCommit.map { commit =>
       commit.valid && entry.robIdx === commit.bits.robidx && entry.uopIdx === commit.bits.uopidx
     }
-    vecLdCommit(i) := entry.valid && matches.reduce(_ || _)
-    writeField(i.U, _.committed, true.B, vecLdCommit(i) && entry.isvec)
+    when(entry.valid && entry.isvec && matches.reduce(_ || _)) {
+      entry.committed := true.B
+    }
   }
 
-  for (i <- 0 until VirtualLoadQueueSize) {
-    writeField(i.U, _.valid, false.B, needCancel(i))
+  update { entry =>
+    when(needsCancel(entry)) { entry.valid := false.B }
   }
 
   XSDebug(p"(ready, valid): ${io.enq.canAccept}, ${Binary(Cat(io.enq.req.map(_.valid)))}\n")
@@ -236,7 +249,7 @@ class VirtualLoadQueue(implicit p: Parameters)
     )
   }
 
-  QueuePerf(VirtualLoadQueueSize, validCount, !allowEnqueue)
+  QueuePerf(VirtualLoadQueueSize, count, !allowEnqueue)
   val vecValidCount = PopCount((0 until VirtualLoadQueueSize).map { i =>
     val entry = read(i)
     entry.valid && entry.isvec
