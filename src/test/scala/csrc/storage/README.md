@@ -55,7 +55,7 @@ resolves the descriptor; the software template never re-runs a Scala selector.
 ## Build and run
 
 ```bash
-cd experiments/storage-model
+cd src/test/scala/csrc/storage
 python3 storage_emit.py storage.json storage_adapter.cpp
 python3 storage_emit.py storage.json storage_adapter.cpp --check
 mkdir -p build
