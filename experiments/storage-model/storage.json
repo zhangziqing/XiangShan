@@ -1,0 +1,65 @@
+{
+  "entries": 4,
+  "width": 8,
+  "pending_writes": 16,
+  "initial": [5, 10, 20, 7],
+  "prefix": "storage",
+  "prepare": {
+    "writes": [
+      {
+        "enable": "write_enable",
+        "index": "write_index",
+        "value": "write_value"
+      }
+    ],
+    "fields": [
+      {
+        "enable": "field_enable",
+        "index": "field_index",
+        "offset": "field_offset",
+        "width": "field_width",
+        "value": "field_value"
+      }
+    ],
+    "cam_writes": [
+      {
+        "enable": "cam_enable",
+        "key": "cam_key",
+        "value": "cam_value"
+      }
+    ],
+    "updates": [
+      {
+        "enable": "update_enable",
+        "amount": "update_amount"
+      }
+    ]
+  },
+  "reads": [
+    {
+      "name": "read_0"
+    },
+    {
+      "name": "read_1"
+    }
+  ],
+  "queries": [
+    {
+      "name": "query_0",
+      "kind": "camRead",
+      "max_hits": 2,
+      "key": "key"
+    },
+    {
+      "name": "query_1",
+      "kind": "camHitVec",
+      "key": "key"
+    },
+    {
+      "name": "query_2",
+      "kind": "camHitIdx",
+      "key": "key"
+    }
+  ],
+  "snapshot": true
+}

@@ -6,10 +6,11 @@ This experiment migrates the Queue boundary scheme from agent
 - **Software function template**: [storage.hpp](storage.hpp) owns the storage
   words, pending writes, reset contents and cycle commit. It exposes one native
   function per Storage semantic.
-- **Few calls**: [storage_adapter.cpp](storage_adapter.cpp) is the generated
-  adapter shape. It has a fixed call set independent of capacity:
-  `prepare`, `read_0`, `read_1`, `query_0`, `query_1`, `query_2`, `snapshot`.
-  No per-slot function is emitted.
+- **Few calls**: [storage.json](storage.json) is the call descriptor and
+  [storage_emit.py](storage_emit.py) generates
+  [storage_adapter.cpp](storage_adapter.cpp). The adapter has a fixed call set
+  independent of capacity: `prepare`, `read_0`, `read_1`, `query_0`, `query_1`,
+  `query_2`, `snapshot`. No per-slot function is emitted.
 
 The Queue reference is `ring_queue.hpp` plus the generated `queue.cpp` from
 `experiments/queue-model` in the `wise-baboon` worktree. There, a 72-entry
@@ -28,7 +29,7 @@ the same call set because the template loops internally.
 | `begin` / `commit` | `begin` / `commit` |
 | `queue_prepare` (one function) | `storage_prepare` (one function) |
 | `queue_query_<id>` (one per result call) | `storage_read_<id>` / `storage_query_<id>` |
-| `static Queue queue` + epoch `sync` | `static Storage storage` + epoch `sync` |
+| `static Queue queue` + epoch `sync` | `static Storage instance` + epoch `sync` |
 
 `writeField` and the field form of `camWrite` accept the lowered form of a
 validated `FieldOf` path: `Field{offset, width}`. The Scala/generator side
@@ -55,6 +56,8 @@ resolves the descriptor; the software template never re-runs a Scala selector.
 
 ```bash
 cd experiments/storage-model
+python3 storage_emit.py storage.json storage_adapter.cpp
+python3 storage_emit.py storage.json storage_adapter.cpp --check
 mkdir -p build
 g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined \
   check_storage.cpp storage_adapter.cpp -o build/check_storage
@@ -70,9 +73,9 @@ update, CAM queries and snapshot.
 
 The template represents fixed-width scalar words up to 64 bits. Bundle entries
 need a generated packer from `FieldOf` paths and per-leaf widths; the current
-`Field` is the scalar lowering. Predicates and transforms are C++ lambdas; a
-capture/emitter would generate the call arguments and lambda bodies from the
-Chisel Storage call sites, analogous to `boundary_capture.py` and
-`boundary_emit.py`. The adapter is a hand-written example of that generated
-shape; one adapter represents one hardware instance, so multiple instances need
-distinct symbols. A SystemVerilog/DPI shell is not included in this prototype.
+`Field` is the scalar lowering. Predicates and transforms are C++ lambdas;
+capturing the Chisel Storage call sites would generate `storage.json`,
+analogous to `boundary_capture.py`; `storage_emit.py` already generates the
+adapter from that descriptor. One adapter represents one hardware instance, so
+multiple instances need distinct symbols. A SystemVerilog/DPI shell is not
+included in this prototype.
