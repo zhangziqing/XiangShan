@@ -10,7 +10,8 @@ abstract class Storage[T <: Data](val entries: Int) extends Module {
   protected def read(index: Int): T
   protected def read(index: UInt): T
   protected def write(index: UInt, content: T): Unit
-  protected def writeField[D <: Data](index: UInt, field: T => D, content: D): Unit
+  /** Writes one validated static member path of the addressed entry. */
+  protected def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
 
   /** Returns one current-state match bit per physical slot, without a hit bound.
     * Validity and query enables belong in the predicate; writes are not forwarded.
@@ -31,7 +32,7 @@ abstract class Storage[T <: Data](val entries: Int) extends Module {
   protected def camWrite[P, D <: Data](
     f: (T, P) => Bool,
     param: P,
-    field: T => D,
+    field: FieldOf[T, D],
     content: D
   ): Unit
 
@@ -78,11 +79,11 @@ class RegStorage[T <: Data](
 
   override protected final def writeField[D <: Data](
     index: UInt,
-    field: T => D,
+    field: FieldOf[T, D],
     content: D
   ): Unit =
     for (slot <- 0 until entries) {
-      when(index === slot.U) { field(contents(slot)) := content }
+      when(index === slot.U) { field.select(contents(slot)) := content }
     }
 
   override protected final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
@@ -135,11 +136,11 @@ class RegStorage[T <: Data](
   override protected final def camWrite[P, D <: Data](
     f: (T, P) => Bool,
     param: P,
-    field: T => D,
+    field: FieldOf[T, D],
     content: D
   ): Unit =
     for (slot <- 0 until entries) {
-      when(f(contents(slot).readOnly, param)) { field(contents(slot)) := content }
+      when(f(contents(slot).readOnly, param)) { field.select(contents(slot)) := content }
     }
 
   override protected final def update(f: T => T): Unit =
