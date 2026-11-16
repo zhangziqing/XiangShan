@@ -5,13 +5,7 @@ import chisel3._
 import chisel3.Data._
 import chisel3.util.{Mux1H, PopCount, log2Ceil}
 
-/** Physical-entry access contract, independent of queue membership.
-  *
-  * A Storage is instantiated inside its owning module; every operation
-  * elaborates in that module, so writes observe the current `when` conditions
-  * and use the owner's clock and reset. Reads are combinational current-state
-  * observations. All entry access is index based.
-  */
+/** Physical-entry access contract, independent of queue membership. */
 abstract class Storage[T <: Data](val entries: Int) {
   def read(index: Int): T
   def read(index: UInt): T
