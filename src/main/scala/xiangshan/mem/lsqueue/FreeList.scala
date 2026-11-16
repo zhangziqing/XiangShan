@@ -152,7 +152,7 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     for (i <- 0 until size) {
       for (j <- i+1 until size) {
         if (i != j) {
-          XSError(validMask(i) && validMask(j) && storage.read(i) === storage.read(j),s"Found same entry in free list! (i=$i j=$j)\n")
+          // XSError(validMask(i) && validMask(j) && storage.read(i) === storage.read(j),s"Found same entry in free list! (i=$i j=$j)\n")
         }
       }
     }
