@@ -19,6 +19,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.RegStorage
 import utility._
 import xiangshan._
 
@@ -40,10 +41,12 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
 
   println(s"FreeList: $moduleName, size " + size)
 
-  val freeList = RegInit(VecInit(
+  private val storage = new RegStorage[UInt](
+    gen = UInt(log2Up(size).W),
+    entries = size,
     // originally {0, 1, ..., size - 1} are free.
-    Seq.tabulate(size)(i => i.U(log2Up(size).W))
-  ))
+    initContents = Some(Seq.tabulate(size)(i => i.U(log2Up(size).W)))
+  )
 
   class FreeListPtr extends CircularQueuePtr[FreeListPtr](size)
   object FreeListPtr {
@@ -95,7 +98,7 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     val enqPtr = tailPtr + offset
 
     when (freeReq(i)) {
-      freeList(enqPtr.value) := OHToUInt(freeSlotOH(i))
+      storage.write(enqPtr.value, OHToUInt(freeSlotOH(i)))
     }
 
     freeSelMaskVec(i) := Mux(freeReq(i), freeSlotOH(i), 0.U)
@@ -115,11 +118,11 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     if (enablePreAlloc) {
       val deqPtr = headPtr + numAllocate + offset
       io.canAllocate(i) := RegEnable(isBefore(deqPtr, tailPtr), enablePreAlloc.B)
-      io.allocateSlot(i) := RegEnable(freeList(deqPtr.value), enablePreAlloc.B)
+      io.allocateSlot(i) := RegEnable(storage.read(deqPtr.value), enablePreAlloc.B)
     } else {
       val deqPtr = headPtr + offset
       io.canAllocate(i) := isBefore(deqPtr, tailPtr)
-      io.allocateSlot(i) := freeList(deqPtr.value)
+      io.allocateSlot(i) := storage.read(deqPtr.value)
     }
 
   }
@@ -149,7 +152,7 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     for (i <- 0 until size) {
       for (j <- i+1 until size) {
         if (i != j) {
-          XSError(validMask(i) && validMask(j) && freeList(i) === freeList(j),s"Found same entry in free list! (i=$i j=$j)\n")
+          XSError(validMask(i) && validMask(j) && storage.read(i) === storage.read(j),s"Found same entry in free list! (i=$i j=$j)\n")
         }
       }
     }
