@@ -19,6 +19,7 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.RegStorage
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -227,8 +228,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   //  Flags       : rar/raw queue allocate flags
   val allocated = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B))) // The control signals need to explicitly indicate the initial value
   val scheduled = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
-  val uop = Reg(Vec(LoadQueueReplaySize, new DynInst))
-  val vecReplay = Reg(Vec(LoadQueueReplaySize, new VecReplayInfo))
+  private val payload = new RegStorage(new LoadReplayPayload, LoadQueueReplaySize)
+  val uop = payload.foreach(_.uop)
+  val vecReplay = payload.foreach(_.vecReplay)
   val vaddrModule = Module(new LqVAddrModule(
     gen = UInt(VAddrBits.W),
     numEntries = LoadQueueReplaySize,
@@ -238,7 +240,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     numWDelay = 2,
     numCamPort = 0))
   vaddrModule.io := DontCare
-  val debug_vaddr = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U(VAddrBits.W))))
+  private val debugVaddr = new RegStorage(UInt(VAddrBits.W), LoadQueueReplaySize,
+    Some(Seq.fill(LoadQueueReplaySize)(0.U(VAddrBits.W))))
+  val debug_vaddr = debugVaddr.foreach(addr => addr)
   val cause = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U(LoadReplayCauses.allCauses.W))))
   val blocking = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
   val strict = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
@@ -258,7 +262,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   /**
    * used for re-select control
    */
-  val blockSqIdx = Reg(Vec(LoadQueueReplaySize, new SqPtr))
+  private val dependency = new RegStorage(new SqPtr, LoadQueueReplaySize)
+  val blockSqIdx = dependency.foreach(ptr => ptr)
   // DCache miss block
   val missMSHRId = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U((log2Up(cfg.nMissEntries+1).W)))))
   val tlbHintId = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U((log2Up(loadfiltersize+1).W)))))
@@ -501,10 +506,11 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
   val replay_req = Wire(Vec(LoadPipelineWidth, DecoupledIO(new LsPipelineBundle)))
 
+  val s1_payload = s1_oldestSel.map(sel => payload.read(sel.bits))
   for (i <- 0 until LoadPipelineWidth) {
     val s0_can_go = s1_can_go(i) ||
-                    uop(s1_oldestSel(i).bits).robIdx.needFlush(io.redirect) ||
-                    uop(s1_oldestSel(i).bits).robIdx.needFlush(RegNext(io.redirect))
+                    s1_payload(i).uop.robIdx.needFlush(io.redirect) ||
+                    s1_payload(i).uop.robIdx.needFlush(RegNext(io.redirect))
     val s0_oldestSelIndexOH = s0_oldestSel(i).bits // one-hot
     s1_oldestSel(i).valid := RegEnable(s0_oldestSel(i).valid, false.B, s0_can_go)
     s1_oldestSel(i).bits := RegEnable(OHToUInt(s0_oldestSel(i).bits), s0_can_go)
@@ -517,8 +523,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   }
   val s2_cancelReplay = Wire(Vec(LoadPipelineWidth, Bool()))
   for (i <- 0 until LoadPipelineWidth) {
-    val s1_cancel = uop(s1_oldestSel(i).bits).robIdx.needFlush(io.redirect) ||
-                    uop(s1_oldestSel(i).bits).robIdx.needFlush(RegNext(io.redirect))
+    val s1_cancel = s1_payload(i).uop.robIdx.needFlush(io.redirect) ||
+                    s1_payload(i).uop.robIdx.needFlush(RegNext(io.redirect))
     val s1_oldestSelV = s1_oldestSel(i).valid && !s1_cancel
     s1_can_go(i)          := replayCanFire(i) && (!s2_oldestSel(i).valid || replay_req(i).fire) || s2_cancelReplay(i)
     s2_oldestSel(i).valid := RegEnable(Mux(s1_can_go(i), s1_oldestSelV, false.B), false.B, (s1_can_go(i) || replay_req(i).fire))
@@ -530,8 +536,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
   for (i <- 0 until LoadPipelineWidth) {
     val s1_replayIdx = s1_oldestSel(i).bits
-    val s2_replayUop = RegEnable(uop(s1_replayIdx), s1_can_go(i))
-    val s2_vecReplay = RegEnable(vecReplay(s1_replayIdx), s1_can_go(i))
+    val s2_replayUop = RegEnable(s1_payload(i).uop, s1_can_go(i))
+    val s2_vecReplay = RegEnable(s1_payload(i).vecReplay, s1_can_go(i))
     val s2_replayMSHRId = RegEnable(missMSHRId(s1_replayIdx), s1_can_go(i))
     val s2_replacementUpdated = RegEnable(replacementUpdated(s1_replayIdx), s1_can_go(i))
     val s2_missDbUpdated = RegEnable(missDbUpdated(s1_replayIdx), s1_can_go(i))
@@ -638,26 +644,29 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       //  Allocate new entry
       allocated(enqIndex) := true.B
       scheduled(enqIndex) := false.B
-      uop(enqIndex)       := enq.bits.uop
-      uop(enqIndex).exceptionVec := 0.U.asTypeOf(enq.bits.uop.exceptionVec)
-      vecReplay(enqIndex).isvec := enq.bits.isvec
-      vecReplay(enqIndex).isLastElem := enq.bits.isLastElem
-      vecReplay(enqIndex).is128bit := enq.bits.is128bit
-      vecReplay(enqIndex).uop_unit_stride_fof := enq.bits.uop_unit_stride_fof
-      vecReplay(enqIndex).usSecondInv := enq.bits.usSecondInv
-      vecReplay(enqIndex).elemIdx := enq.bits.elemIdx
-      vecReplay(enqIndex).alignedType:= enq.bits.alignedType
-      vecReplay(enqIndex).mbIndex := enq.bits.mbIndex
-      vecReplay(enqIndex).elemIdxInsideVd := enq.bits.elemIdxInsideVd
-      vecReplay(enqIndex).reg_offset := enq.bits.reg_offset
-      vecReplay(enqIndex).vecActive := enq.bits.vecActive
-      vecReplay(enqIndex).is_first_ele := enq.bits.is_first_ele
-      vecReplay(enqIndex).mask         := enq.bits.mask
+      val enqPayload = Wire(new LoadReplayPayload)
+      enqPayload.uop := enq.bits.uop
+      enqPayload.uop.exceptionVec := 0.U.asTypeOf(enq.bits.uop.exceptionVec)
+      enqPayload.vecReplay.isvec := enq.bits.isvec
+      enqPayload.vecReplay.isLastElem := enq.bits.isLastElem
+      enqPayload.vecReplay.is128bit := enq.bits.is128bit
+      enqPayload.vecReplay.uop_unit_stride_fof := enq.bits.uop_unit_stride_fof
+      enqPayload.vecReplay.usSecondInv := enq.bits.usSecondInv
+      enqPayload.vecReplay.elemIdx := enq.bits.elemIdx
+      enqPayload.vecReplay.alignedType:= enq.bits.alignedType
+      enqPayload.vecReplay.mbIndex := enq.bits.mbIndex
+      enqPayload.vecReplay.elemIdxInsideVd := enq.bits.elemIdxInsideVd
+      enqPayload.vecReplay.reg_offset := enq.bits.reg_offset
+      enqPayload.vecReplay.vecActive := enq.bits.vecActive
+      enqPayload.vecReplay.is_first_ele := enq.bits.is_first_ele
+      enqPayload.vecReplay.mask         := enq.bits.mask
+
+      payload.write(enqIndex, enqPayload)
 
       vaddrModule.io.wen(w)   := true.B
       vaddrModule.io.waddr(w) := enqIndex
       vaddrModule.io.wdata(w) := enq.bits.vaddr
-      debug_vaddr(enqIndex)   := enq.bits.vaddr
+      debugVaddr.write(enqIndex, enq.bits.vaddr)
 
       /**
        * used for feedback and replay
@@ -698,13 +707,13 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
       // special case: st-ld violation
       when (replayInfo.cause(LoadReplayCauses.C_MA)) {
-        blockSqIdx(enqIndex) := replayInfo.addr_inv_sq_idx
+        dependency.write(enqIndex, replayInfo.addr_inv_sq_idx)
         strict(enqIndex) := enq.bits.uop.loadWaitStrict
       }
 
       // special case: data forward fail
       when (replayInfo.cause(LoadReplayCauses.C_FF)) {
-        blockSqIdx(enqIndex) := replayInfo.data_inv_sq_idx
+        dependency.write(enqIndex, replayInfo.data_inv_sq_idx)
       }
       // extra info
       replayCarryReg(enqIndex) := replayInfo.rep_carry
