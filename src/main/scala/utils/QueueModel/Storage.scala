@@ -6,42 +6,42 @@ import chisel3.Data._
 import chisel3.util.{Mux1H, PopCount, log2Ceil}
 
 /** Physical-entry access contract, independent of queue membership. */
-abstract class Storage[T <: Data](val entries: Int) extends Module {
-  protected def read(index: Int): T
-  protected def read(index: UInt): T
-  protected def write(index: UInt, content: T): Unit
+abstract class Storage[T <: Data](val entries: Int) {
+  def read(index: Int): T
+  def read(index: UInt): T
+  def write(index: UInt, content: T): Unit
   /** Writes one validated static member path of the addressed entry. */
-  protected def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
+  def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
 
   /** Returns one current-state match bit per physical slot, without a hit bound.
     * Validity and query enables belong in the predicate; writes are not forwarded.
     */
-  protected def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool]
+  def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool]
 
   /** Returns `entries` ascending matching indices, padded with the invalid index
     * `entries`. Each unsigned index has width `max(1, log2Ceil(entries + 1))`.
     * Like camHitVec, this is a combinational query of current state.
     */
-  protected def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt]
+  def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt]
 
   /** Returns `maxHits` (data, hit) pairs in physical index order, padding misses
     * with (zero, false). Asserts if more than `maxHits` entries match.
     */
-  protected def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int = 1): Seq[(T, Bool)]
-  protected def camWrite[P](f: (T, P) => Bool, param: P, content: T): Unit
-  protected def camWrite[P, D <: Data](
+  def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int = 1): Seq[(T, Bool)]
+  def camWrite[P](f: (T, P) => Bool, param: P, content: T): Unit
+  def camWrite[P, D <: Data](
     f: (T, P) => Bool,
     param: P,
     field: FieldOf[T, D],
     content: D
   ): Unit
 
-  protected def update(f: T => T): Unit
+  def update(f: T => T): Unit
 
   /** Maps each read-only current entry to one result in physical index order.
     * The result has `entries` elements; pending writes are not forwarded.
     */
-  protected def foreach[A <: Data](f: T => A): Seq[A]
+  def foreach[A <: Data](f: T => A): Seq[A]
 }
 
 /** Register-backed implementation of the Storage contract. */
@@ -61,23 +61,23 @@ class RegStorage[T <: Data](
     case None => Reg(Vec(entries, gen))
   }
 
-  override protected final def read(index: Int): T = {
+  override final def read(index: Int): T = {
     require(index >= 0 && index < entries, "static storage index is out of range")
     contents(index).readOnly
   }
 
-  override protected final def read(index: UInt): T = {
+  override final def read(index: UInt): T = {
     val selected = (0 until entries).map(slot => index === slot.U)
     val anySelected = selected.reduce(_ || _)
     Mux(anySelected, Mux1H(selected, contents.toSeq), 0.U.asTypeOf(gen)).readOnly
   }
 
-  override protected final def write(index: UInt, content: T): Unit =
+  override final def write(index: UInt, content: T): Unit =
     for (slot <- 0 until entries) {
       when(index === slot.U) { contents(slot) := content }
     }
 
-  override protected final def writeField[D <: Data](
+  override final def writeField[D <: Data](
     index: UInt,
     field: FieldOf[T, D],
     content: D
@@ -86,7 +86,7 @@ class RegStorage[T <: Data](
       when(index === slot.U) { field.select(contents(slot)) := content }
     }
 
-  override protected final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
     contents.toSeq.map(entry => f(entry.readOnly, arg).readOnly)
 
   private def rankedHitMasks(hits: Seq[Bool], count: Int): Seq[Seq[Bool]] = {
@@ -99,7 +99,7 @@ class RegStorage[T <: Data](
     }
   }
 
-  override protected final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] = {
+  override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] = {
     val indexWidth = math.max(1, log2Ceil(entries + 1))
     val indices = (0 until entries).map(_.U(indexWidth.W))
     rankedHitMasks(camHitVec(f, arg), entries).map { mask =>
@@ -108,7 +108,7 @@ class RegStorage[T <: Data](
     }
   }
 
-  override protected final def camRead[A](
+  override final def camRead[A](
     f: (T, A) => Bool,
     arg: A,
     maxHits: Int
@@ -124,7 +124,7 @@ class RegStorage[T <: Data](
     }
   }
 
-  override protected final def camWrite[P](
+  override final def camWrite[P](
     f: (T, P) => Bool,
     param: P,
     content: T
@@ -133,7 +133,7 @@ class RegStorage[T <: Data](
       when(f(contents(slot).readOnly, param)) { contents(slot) := content }
     }
 
-  override protected final def camWrite[P, D <: Data](
+  override final def camWrite[P, D <: Data](
     f: (T, P) => Bool,
     param: P,
     field: FieldOf[T, D],
@@ -143,9 +143,9 @@ class RegStorage[T <: Data](
       when(f(contents(slot).readOnly, param)) { field.select(contents(slot)) := content }
     }
 
-  override protected final def update(f: T => T): Unit =
+  override final def update(f: T => T): Unit =
     contents.foreach(entry => entry := f(entry.readOnly))
 
-  override protected final def foreach[A <: Data](f: T => A): Seq[A] =
+  override final def foreach[A <: Data](f: T => A): Seq[A] =
     contents.toSeq.map(entry => f(entry.readOnly))
 }

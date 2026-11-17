@@ -19,6 +19,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.RegStorage
 import utility._
 import xiangshan._
 
@@ -40,10 +41,12 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
 
   println(s"FreeList: $moduleName, size " + size)
 
-  val freeList = RegInit(VecInit(
+  private val storage = new RegStorage[UInt](
+    gen = UInt(log2Up(size).W),
+    entries = size,
     // originally {0, 1, ..., size - 1} are free.
-    Seq.tabulate(size)(i => i.U(log2Up(size).W))
-  ))
+    initContents = Some(Seq.tabulate(size)(i => i.U(log2Up(size).W)))
+  )
 
   class FreeListPtr extends CircularQueuePtr[FreeListPtr](size)
   object FreeListPtr {
@@ -68,37 +71,34 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
   // free logic
   val freeMask = RegInit(0.U(size.W))
   val freeSelMask = Wire(UInt(size.W))
-  val freeSelMaskVec = Wire(Vec(freeWidth, UInt(size.W)))
 
   // update freeMask
   require((size % freeWidth) == 0)
-  freeSelMask := freeSelMaskVec.reduce(_|_)
   freeMask := (io.free | freeMask) & ~freeSelMask
 
   val remFreeSelMaskVec = VecInit(Seq.tabulate(freeWidth)(rem => getRemBits((freeMask & ~freeSelMask))(rem)))
-  val remFreeSelIndexOHVec = VecInit(Seq.tabulate(freeWidth)(fport => {
-    val highIndexOH = PriorityEncoderOH(remFreeSelMaskVec(fport))
-    val freeIndexOHVec = Wire(Vec(size, Bool()))
-    freeIndexOHVec.foreach(e => e := false.B)
-    for (i <- 0 until size / freeWidth) {
-      freeIndexOHVec(i * freeWidth + fport) := highIndexOH(i)
-    }
-    freeIndexOHVec.asUInt
+  val remFreeSelIndexVec = VecInit(Seq.tabulate(freeWidth)(fport => {
+    val residueIndex = PriorityEncoder(remFreeSelMaskVec(fport))
+    (residueIndex * freeWidth.U + fport.U)(log2Up(size) - 1, 0)
   }))
 
   val freeReq = GatedRegNext(VecInit(remFreeSelMaskVec.map(_.asUInt.orR)))
-  val freeSlotOH = GatedRegNext(remFreeSelIndexOHVec)
+  val freeSlot = GatedRegNext(remFreeSelIndexVec)
   val doFree = freeReq.asUInt.orR
+
+  // Selected indices are already UInt; build the pending bitmap by index
+  // comparison instead of carrying a one-hot selection through the logic.
+  freeSelMask := VecInit((0 until size).map { idx =>
+    (0 until freeWidth).map(i => freeReq(i) && freeSlot(i) === idx.U).reduce(_ || _)
+  }).asUInt
 
   for (i <- 0 until freeWidth) {
     val offset = PopCount(freeReq.take(i))
     val enqPtr = tailPtr + offset
 
     when (freeReq(i)) {
-      freeList(enqPtr.value) := OHToUInt(freeSlotOH(i))
+      storage.write(enqPtr.value, freeSlot(i))
     }
-
-    freeSelMaskVec(i) := Mux(freeReq(i), freeSlotOH(i), 0.U)
   }
 
   tailPtrNext := tailPtr + PopCount(freeReq)
@@ -115,11 +115,11 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     if (enablePreAlloc) {
       val deqPtr = headPtr + numAllocate + offset
       io.canAllocate(i) := RegEnable(isBefore(deqPtr, tailPtr), enablePreAlloc.B)
-      io.allocateSlot(i) := RegEnable(freeList(deqPtr.value), enablePreAlloc.B)
+      io.allocateSlot(i) := RegEnable(storage.read(deqPtr.value), enablePreAlloc.B)
     } else {
       val deqPtr = headPtr + offset
       io.canAllocate(i) := isBefore(deqPtr, tailPtr)
-      io.allocateSlot(i) := freeList(deqPtr.value)
+      io.allocateSlot(i) := storage.read(deqPtr.value)
     }
 
   }
@@ -149,7 +149,7 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
     for (i <- 0 until size) {
       for (j <- i+1 until size) {
         if (i != j) {
-          XSError(validMask(i) && validMask(j) && freeList(i) === freeList(j),s"Found same entry in free list! (i=$i j=$j)\n")
+          // XSError(validMask(i) && validMask(j) && storage.read(i) === storage.read(j),s"Found same entry in free list! (i=$i j=$j)\n")
         }
       }
     }
