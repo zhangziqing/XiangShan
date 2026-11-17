@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 package IntentionModel
 
-import chisel3._
 import chisel3.Data._
+import chisel3._
 import chisel3.experimental.{annotate, ChiselAnnotation}
+import chisel3.util.HasBlackBoxInline
 import firrtl.annotations.Annotation
+import scala.collection.immutable.ListMap
 import scala.collection.mutable.ArrayBuffer
 import utils.QueueModel.{FieldOf, Storage}
 
@@ -161,4 +163,120 @@ class ModelStorage[T <: Data](
       }
     })
   })
+}
+
+/** Opt-in lifecycle for directly instantiated software storage in this module.
+  * Registration may occur in a superclass constructor, before this trait's body.
+  */
+trait StorageModelOwner extends Module with RequireSyncReset {
+  private lazy val storageModels = ArrayBuffer.empty[() => Unit]
+  private[IntentionModel] final def registerStorage(finish: () => Unit): Unit =
+    storageModels += finish
+
+  atModuleBodyEnd { storageModels.foreach(_()) }
+}
+
+sealed trait StorageReadBridgeMode
+object StorageReadBridgeMode {
+  case object PerRead extends StorageReadBridgeMode
+  case object PerStorage extends StorageReadBridgeMode
+}
+
+/** One pure current-state query per source read, independent of entry count. */
+class StorageReadBridge(width: Int, storageId: StorageId, opId: OpId)
+  extends BlackBox with HasBlackBoxInline {
+  require(width > 0 && width <= 64, "DPI read width must be in 1..64")
+  override def desiredName: String = s"StorageReadBridge_${storageId.value}_${opId.value}"
+  val io = IO(new Bundle {
+    val epoch = Input(Bool())
+    val index = Input(UInt(64.W))
+    val value = Output(UInt(width.W))
+  })
+  setInline(s"$desiredName.sv",
+    s"""module $desiredName(
+       |  input epoch, input [63:0] index,
+       |  output logic [${width - 1}:0] value
+       |);
+       |  import "DPI-C" function longint unsigned ${StorageDPIEmitter.readName(storageId)}(
+       |    input longint unsigned index, input bit epoch);
+       |  always_comb begin
+       |    value = $width'(${StorageDPIEmitter.readName(storageId)}(index, epoch));
+       |  end
+       |endmodule
+       |""".stripMargin)
+}
+
+private[IntentionModel] class StorageReadBatchIO(width: Int, count: Int) extends Record {
+  val elements = ListMap((Seq("epoch" -> Input(Bool())) ++ (0 until count).flatMap(i => Seq(
+    s"index_$i" -> Input(UInt(64.W)), s"value_$i" -> Output(UInt(width.W))
+  ))): _*)
+  def epoch: Bool = elements("epoch").asInstanceOf[Bool]
+  def index(i: Int): UInt = elements(s"index_$i").asInstanceOf[UInt]
+  def value(i: Int): UInt = elements(s"value_$i").asInstanceOf[UInt]
+}
+
+/** All read sites share one query boundary. Any address change refreshes every port. */
+private[IntentionModel] class StorageReadBatchBridge(width: Int, storageId: StorageId, count: Int)
+  extends BlackBox with HasBlackBoxInline {
+  require(width > 0 && width <= 64, "DPI read width must be in 1..64")
+  require(count > 0, "A batch read bridge requires at least one read")
+  override def desiredName: String = s"StorageReadBatchBridge_${storageId.value}"
+  val io = IO(new StorageReadBatchIO(width, count))
+  private val ports = (0 until count).map(i =>
+    s", input [63:0] index_$i, output logic [${width - 1}:0] value_$i").mkString
+  private val args = (0 until count).map(i =>
+    s", input longint unsigned index_$i, output longint unsigned bits_$i").mkString
+  private val words = (0 until count).map(i => s"longint unsigned bits_$i;").mkString("\n")
+  private val inputs = (0 until count).map(i => s", index_$i, bits_$i").mkString
+  private val outputs = (0 until count).map(i => s"value_$i = bits_$i[${width - 1}:0];").mkString("\n")
+  setInline(s"$desiredName.sv",
+    s"""module $desiredName(input epoch$ports);
+       |  import "DPI-C" function void ${StorageDPIEmitter.readBatchName(storageId)}(input bit epoch$args);
+       |  $words
+       |  always_comb begin
+       |    ${StorageDPIEmitter.readBatchName(storageId)}(epoch$inputs);
+       |    $outputs
+       |  end
+       |endmodule
+       |""".stripMargin)
+}
+
+final case class StorageCycleField(name: String, width: Int, offset: Int) {
+  def end: Int = offset + width
+  def word: Int = offset / 64
+  def shift: Int = offset % 64
+}
+
+/** Fixed operand layout shared by the SV sampler and generated C++ decoder.
+  * Fields never cross a 64-bit DPI word; padding is always zero.
+  */
+final case class StorageCyclePacking(writeWidths: Vector[(Int, Int)]) {
+  val fields: Vector[StorageCycleField] = {
+    val widths = Vector("reset" -> 1) ++ writeWidths.zipWithIndex.flatMap { case ((index, value), i) =>
+      Vector(s"guard_$i" -> 1, s"index_$i" -> index, s"value_$i" -> value)
+    }
+    var next = 0
+    widths.map { case (name, width) =>
+      require(width > 0 && width <= 64, "cycle operand width must be in 1..64")
+      if (next % 64 + width > 64) next += 64 - next % 64
+      val field = StorageCycleField(name, width, next)
+      next = field.end
+      field
+    }
+  }
+  val totalWidth: Int = fields.last.end
+  val words: Int = (totalWidth + 63) / 64
+  def field(name: String): StorageCycleField = fields.find(_.name == name).get
+}
+
+object StorageCyclePacking {
+  def fromIR(ir: StorageIR): StorageCyclePacking = {
+    val types = ir.values.map(v => v.id -> v.tpe).toMap
+    def widths(index: Operand, value: Operand): (Int, Int) =
+      StorageLayout.width(types(index.value)) -> StorageLayout.width(types(value.value))
+    StorageCyclePacking(ir.operations.collect {
+      case WriteOp(_, _, _, index, value, _) => widths(index, value)
+      case WriteFieldOp(_, _, _, index, _, value, _) => widths(index, value)
+    })
+  }
 }
