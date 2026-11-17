@@ -19,11 +19,15 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
-import utils.QueueModel.RegStorage
+import utils.QueueModel.{RegStorage, Storage}
 import utility._
 import xiangshan._
 
-class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean = false, moduleName: String = "")(implicit p: Parameters) extends XSModule
+class FreeList(
+  size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean = false, moduleName: String = "",
+  storageFactory: (UInt, Int, Option[Seq[UInt]]) => Storage[UInt] =
+    (gen, entries, initial) => new RegStorage(gen, entries, initial)
+)(implicit p: Parameters) extends XSModule
   with HasCircularQueuePtrHelper
   with HasPerfEvents
 {
@@ -41,11 +45,11 @@ class FreeList(size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boole
 
   println(s"FreeList: $moduleName, size " + size)
 
-  private val storage = new RegStorage[UInt](
-    gen = UInt(log2Up(size).W),
-    entries = size,
+  private val storage = storageFactory(
+    UInt(log2Up(size).W),
+    size,
     // originally {0, 1, ..., size - 1} are free.
-    initContents = Some(Seq.tabulate(size)(i => i.U(log2Up(size).W)))
+    Some(Seq.tabulate(size)(i => i.U(log2Up(size).W)))
   )
 
   class FreeListPtr extends CircularQueuePtr[FreeListPtr](size)

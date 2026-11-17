@@ -46,6 +46,7 @@ class XiangShanStage extends ChiselStage {
         firrtl.options.Dependency[chisel3.stage.phases.AddImplicitOutputAnnotationFile],
         firrtl.options.Dependency[chisel3.stage.phases.AddSerializationAnnotations],
         firrtl.options.Dependency[chisel3.stage.phases.Convert],
+        firrtl.options.Dependency[IntentionModel.StorageCapturePhase],
         firrtl.options.Dependency[xiangshan.transforms.PrintModuleName],
         firrtl.options.Dependency[xiangshan.transforms.PrintControl],
         firrtl.options.Dependency[chisel3.stage.phases.AddDedupGroupAnnotations],
