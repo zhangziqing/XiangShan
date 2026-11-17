@@ -231,16 +231,6 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   private val allocatedField = FieldOf(new LoadReplayMeta)(_.allocated)
   private val scheduledField = FieldOf(new LoadReplayMeta)(_.scheduled)
   private val blockingField = FieldOf(new LoadReplayMeta)(_.blocking)
-  private val strictField = FieldOf(new LoadReplayMeta)(_.strict)
-  private val causeField = FieldOf(new LoadReplayMeta)(_.cause)
-  private val missMSHRIdField = FieldOf(new LoadReplayMeta)(_.missMSHRId)
-  private val tlbHintIdField = FieldOf(new LoadReplayMeta)(_.tlbHintId)
-  private val replacementUpdatedField = FieldOf(new LoadReplayMeta)(_.replacementUpdated)
-  private val missDbUpdatedField = FieldOf(new LoadReplayMeta)(_.missDbUpdated)
-  private val replayCarryField = FieldOf(new LoadReplayMeta)(_.replayCarry)
-  private val dataInLastBeatField = FieldOf(new LoadReplayMeta)(_.dataInLastBeat)
-  private val keyField = FieldOf(new LoadReplayMeta)(_.key)
-  private val blockSqIdxField = FieldOf(new LoadReplayMeta)(_.blockSqIdx)
   private val payload: Storage[LoadReplayPayload] = new RegStorage(new LoadReplayPayload, LoadQueueReplaySize)
   val vaddrModule = Module(new LqVAddrModule(
     gen = UInt(VAddrBits.W),
@@ -584,24 +574,27 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     enqIndexOH(w) := UIntToOH(enqIndex)
     enq.ready := true.B
 
+    val currentMeta = meta.read(enqIndex)
+    // Retain conditional IDs and the dependency pointer from current state.
+    // LqVAddrModule requires concurrent enqueue writes to target distinct slots.
+    val nextMeta = WireInit(currentMeta)
+
     val debug_robIdx = enq.bits.uop.robIdx.asUInt
     XSError(
       needEnqueue(w) && enq.ready &&
-      meta.read(enqIndex).allocated && !enq.bits.isLoadReplay,
+      currentMeta.allocated && !enq.bits.isLoadReplay,
       p"LoadQueueReplay: can not accept more load, check: ldu $w, robIdx $debug_robIdx!")
 
     when (needEnqueue(w) && enq.ready) {
       freeList.io.doAllocate(w) := !enq.bits.isLoadReplay
 
       //  Allocate new entry
-      meta.writeField(enqIndex, allocatedField, true.B)
-      meta.writeField(enqIndex, scheduledField, false.B)
-      val enqKey = Wire(new LoadReplayKey)
-      enqKey.robIdx := enq.bits.uop.robIdx
-      enqKey.lqIdx := enq.bits.uop.lqIdx
-      enqKey.sqIdx := enq.bits.uop.sqIdx
-      enqKey.uopIdx := enq.bits.uop.uopIdx
-      meta.writeField(enqIndex, keyField, enqKey)
+      nextMeta.allocated := true.B
+      nextMeta.scheduled := false.B
+      nextMeta.key.robIdx := enq.bits.uop.robIdx
+      nextMeta.key.lqIdx := enq.bits.uop.lqIdx
+      nextMeta.key.sqIdx := enq.bits.uop.sqIdx
+      nextMeta.key.uopIdx := enq.bits.uop.uopIdx
       val enqPayload = Wire(new LoadReplayPayload)
       enqPayload.uop := enq.bits.uop
       enqPayload.uop.exceptionVec := 0.U.asTypeOf(enq.bits.uop.exceptionVec)
@@ -632,12 +625,11 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       // set flags
       val replayInfo = enq.bits.rep_info
       val dataInLastBeat = replayInfo.last_beat
-      meta.writeField(enqIndex, causeField, replayInfo.cause.asUInt)
-
+      nextMeta.cause := replayInfo.cause.asUInt
 
       // init
-      meta.writeField(enqIndex, blockingField, true.B)
-      meta.writeField(enqIndex, strictField, false.B)
+      nextMeta.blocking := true.B
+      nextMeta.strict := false.B
 
       // update blocking pointer
       when (replayInfo.cause(LoadReplayCauses.C_BC) ||
@@ -646,42 +638,43 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
             replayInfo.cause(LoadReplayCauses.C_WF)) {
         // normal case: bank conflict or schedule error or dcache replay
         // can replay next cycle
-        meta.writeField(enqIndex, blockingField, false.B)
+        nextMeta.blocking := false.B
       }
 
       // special case: tlb miss
       when (replayInfo.cause(LoadReplayCauses.C_TM)) {
-        meta.writeField(enqIndex, blockingField, !replayInfo.tlb_full &&
-          !(io.tlb_hint.resp.valid && (io.tlb_hint.resp.bits.id === replayInfo.tlb_id || io.tlb_hint.resp.bits.replay_all)))
-        meta.writeField(enqIndex, tlbHintIdField, replayInfo.tlb_id)
+        nextMeta.blocking := !replayInfo.tlb_full &&
+          !(io.tlb_hint.resp.valid && (io.tlb_hint.resp.bits.id === replayInfo.tlb_id || io.tlb_hint.resp.bits.replay_all))
+        nextMeta.tlbHintId := replayInfo.tlb_id
       }
 
       // special case: dcache miss
       when (replayInfo.cause(LoadReplayCauses.C_DM) && enq.bits.handledByMSHR) {
-        meta.writeField(enqIndex, blockingField, !replayInfo.full_fwd && //  dcache miss
-                              !(io.tl_d_channel.valid && io.tl_d_channel.mshrid === replayInfo.mshr_id) && // no refill in this cycle
-                              !(RegNext(io.tl_d_channel.valid) && RegNext(io.tl_d_channel.mshrid) === replayInfo.mshr_id)) // not refill in last cycle
+        nextMeta.blocking := !replayInfo.full_fwd && //  dcache miss
+                             !(io.tl_d_channel.valid && io.tl_d_channel.mshrid === replayInfo.mshr_id) && // no refill in this cycle
+                             !(RegNext(io.tl_d_channel.valid) && RegNext(io.tl_d_channel.mshrid) === replayInfo.mshr_id) // not refill in last cycle
       }
 
       // special case: st-ld violation
       when (replayInfo.cause(LoadReplayCauses.C_MA)) {
-        meta.writeField(enqIndex, blockSqIdxField, replayInfo.addr_inv_sq_idx)
-        meta.writeField(enqIndex, strictField, enq.bits.uop.loadWaitStrict)
+        nextMeta.blockSqIdx := replayInfo.addr_inv_sq_idx
+        nextMeta.strict := enq.bits.uop.loadWaitStrict
       }
 
       // special case: data forward fail
       when (replayInfo.cause(LoadReplayCauses.C_FF)) {
-        meta.writeField(enqIndex, blockSqIdxField, replayInfo.data_inv_sq_idx)
+        nextMeta.blockSqIdx := replayInfo.data_inv_sq_idx
       }
       // extra info
-      meta.writeField(enqIndex, replayCarryField, replayInfo.rep_carry)
-      meta.writeField(enqIndex, replacementUpdatedField, enq.bits.replacementUpdated)
-      meta.writeField(enqIndex, missDbUpdatedField, enq.bits.missDbUpdated)
+      nextMeta.replayCarry := replayInfo.rep_carry
+      nextMeta.replacementUpdated := enq.bits.replacementUpdated
+      nextMeta.missDbUpdated := enq.bits.missDbUpdated
       // update mshr_id only when the load has already been handled by mshr
       when(enq.bits.handledByMSHR) {
-        meta.writeField(enqIndex, missMSHRIdField, replayInfo.mshr_id)
+        nextMeta.missMSHRId := replayInfo.mshr_id
       }
-      meta.writeField(enqIndex, dataInLastBeatField, dataInLastBeat)
+      nextMeta.dataInLastBeat := dataInLastBeat
+      meta.write(enqIndex, nextMeta)
     }
 
     //
