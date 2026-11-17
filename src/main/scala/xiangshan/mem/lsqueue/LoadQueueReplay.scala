@@ -17,9 +17,10 @@ package xiangshan.mem
 
 import org.chipsalliance.cde.config._
 import chisel3._
+import chisel3.Data._
 import chisel3.util._
 import utils._
-import utils.QueueModel.RegStorage
+import utils.QueueModel.{FieldOf, RegStorage}
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -226,8 +227,21 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   //  VAddr       : virtual address
   //  Cause       : replay cause
   //  Flags       : rar/raw queue allocate flags
-  val allocated = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B))) // The control signals need to explicitly indicate the initial value
-  val scheduled = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
+  private val meta = new RegStorage(new LoadReplayMeta, LoadQueueReplaySize,
+    Some(Seq.fill(LoadQueueReplaySize)(0.U.asTypeOf(new LoadReplayMeta))))
+  private val allocatedField = FieldOf(new LoadReplayMeta)(_.allocated)
+  private val scheduledField = FieldOf(new LoadReplayMeta)(_.scheduled)
+  private val blockingField = FieldOf(new LoadReplayMeta)(_.blocking)
+  private val strictField = FieldOf(new LoadReplayMeta)(_.strict)
+  private val causeField = FieldOf(new LoadReplayMeta)(_.cause)
+  private val missMSHRIdField = FieldOf(new LoadReplayMeta)(_.missMSHRId)
+  private val tlbHintIdField = FieldOf(new LoadReplayMeta)(_.tlbHintId)
+  private val replacementUpdatedField = FieldOf(new LoadReplayMeta)(_.replacementUpdated)
+  private val missDbUpdatedField = FieldOf(new LoadReplayMeta)(_.missDbUpdated)
+  private val replayCarryField = FieldOf(new LoadReplayMeta)(_.replayCarry)
+  private val dataInLastBeatField = FieldOf(new LoadReplayMeta)(_.dataInLastBeat)
+  val allocated = VecInit(meta.foreach(_.allocated)).readOnly
+  val scheduled = VecInit(meta.foreach(_.scheduled)).readOnly
   private val payload = new RegStorage(new LoadReplayPayload, LoadQueueReplaySize)
   val uop = payload.foreach(_.uop)
   val vecReplay = payload.foreach(_.vecReplay)
@@ -243,9 +257,9 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   private val debugVaddr = new RegStorage(UInt(VAddrBits.W), LoadQueueReplaySize,
     Some(Seq.fill(LoadQueueReplaySize)(0.U(VAddrBits.W))))
   val debug_vaddr = debugVaddr.foreach(addr => addr)
-  val cause = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U(LoadReplayCauses.allCauses.W))))
-  val blocking = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
-  val strict = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
+  val cause = VecInit(meta.foreach(_.cause)).readOnly
+  val blocking = VecInit(meta.foreach(_.blocking)).readOnly
+  val strict = VecInit(meta.foreach(_.strict)).readOnly
 
   // freeliset: store valid entries index.
   // +---+---+--------------+-----+-----+
@@ -265,14 +279,14 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   private val dependency = new RegStorage(new SqPtr, LoadQueueReplaySize)
   val blockSqIdx = dependency.foreach(ptr => ptr)
   // DCache miss block
-  val missMSHRId = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U((log2Up(cfg.nMissEntries+1).W)))))
-  val tlbHintId = RegInit(VecInit(List.fill(LoadQueueReplaySize)(0.U((log2Up(loadfiltersize+1).W)))))
+  val missMSHRId = VecInit(meta.foreach(_.missMSHRId)).readOnly
+  val tlbHintId = VecInit(meta.foreach(_.tlbHintId)).readOnly
   // Has this load already updated dcache replacement?
-  val replacementUpdated = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
-  val missDbUpdated = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
+  val replacementUpdated = VecInit(meta.foreach(_.replacementUpdated)).readOnly
+  val missDbUpdated = VecInit(meta.foreach(_.missDbUpdated)).readOnly
   val trueCacheMissReplay = WireInit(VecInit(cause.map(_(LoadReplayCauses.C_DM))))
-  val replayCarryReg = RegInit(VecInit(List.fill(LoadQueueReplaySize)(ReplayCarry(nWays, 0.U, false.B))))
-  val dataInLastBeatReg = RegInit(VecInit(List.fill(LoadQueueReplaySize)(false.B)))
+  val replayCarryReg = VecInit(meta.foreach(_.replayCarry)).readOnly
+  val dataInLastBeatReg = VecInit(meta.foreach(_.dataInLastBeat)).readOnly
   //  LoadQueueReplay deallocate
   val freeMaskVec = Wire(Vec(LoadQueueReplaySize, Bool()))
 
@@ -340,37 +354,38 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     stDataDeqVec(i) := allocated(i) && storeDataValidVec(i)
   })
 
+  // Ordered field writes preserve the original cause and enqueue priorities.
   // update blocking condition
   (0 until LoadQueueReplaySize).map(i => {
     // case C_MA
     when (cause(i)(LoadReplayCauses.C_MA)) {
-      blocking(i) := Mux(stAddrDeqVec(i), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux(stAddrDeqVec(i), false.B, blocking(i)))
     }
     // case C_TM
     when (cause(i)(LoadReplayCauses.C_TM)) {
-      blocking(i) := Mux(io.tlb_hint.resp.valid &&
+      meta.writeField(i.U, blockingField, Mux(io.tlb_hint.resp.valid &&
                      (io.tlb_hint.resp.bits.replay_all ||
-                     io.tlb_hint.resp.bits.id === tlbHintId(i)), false.B, blocking(i))
+                     io.tlb_hint.resp.bits.id === tlbHintId(i)), false.B, blocking(i)))
     }
     // case C_FF
     when (cause(i)(LoadReplayCauses.C_FF)) {
-      blocking(i) := Mux(stDataDeqVec(i), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux(stDataDeqVec(i), false.B, blocking(i)))
     }
     // case C_DM
     when (cause(i)(LoadReplayCauses.C_DM)) {
-      blocking(i) := Mux(io.tl_d_channel.valid && io.tl_d_channel.mshrid === missMSHRId(i), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux(io.tl_d_channel.valid && io.tl_d_channel.mshrid === missMSHRId(i), false.B, blocking(i)))
     }
     // case C_RAR
     when (cause(i)(LoadReplayCauses.C_RAR)) {
-      blocking(i) := Mux((!io.rarFull || !isAfter(uop(i).lqIdx, io.ldWbPtr)), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux((!io.rarFull || !isAfter(uop(i).lqIdx, io.ldWbPtr)), false.B, blocking(i)))
     }
     // case C_RAW
     when (cause(i)(LoadReplayCauses.C_RAW)) {
-      blocking(i) := Mux((!io.rawFull || !isAfter(uop(i).sqIdx, io.stAddrReadySqPtr)), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux((!io.rawFull || !isAfter(uop(i).sqIdx, io.stAddrReadySqPtr)), false.B, blocking(i)))
     }
     // case C_MF
     when (cause(i)(LoadReplayCauses.C_MF)) {
-      blocking(i) := Mux(!isAfter(uop(i).robIdx, io.robDeqPtr), false.B, blocking(i))
+      meta.writeField(i.U, blockingField, Mux(!isAfter(uop(i).robIdx, io.robDeqPtr), false.B, blocking(i)))
     }
   })
 
@@ -405,9 +420,11 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
   // l2 hint wakes up cache missed load
   // l2 will send GrantData in next 2/3 cycle, wake up the missed load early and sent them to load pipe, so them will hit the data in D channel or mshr in load S1
-  val s0_loadHintWakeMask = VecInit((0 until LoadQueueReplaySize).map(i => {
-    allocated(i) && !scheduled(i) && cause(i)(LoadReplayCauses.C_DM) && blocking(i) && missMSHRId(i) === io.l2_hint.bits.sourceId && io.l2_hint.valid
-  })).asUInt
+  val l2HintWake = (entry: LoadReplayMeta, hint: ValidIO[L2ToL1Hint]) => {
+    entry.allocated && !entry.scheduled && entry.cause(LoadReplayCauses.C_DM) &&
+      entry.blocking && entry.missMSHRId === hint.bits.sourceId && hint.valid
+  }
+  val s0_loadHintWakeMask = VecInit(meta.camHitVec(l2HintWake, io.l2_hint)).asUInt
   // l2 will send 2 beats data in 2 cycles, so if data needed by this load is in first beat, select it this cycle, otherwise next cycle
   // when isKeyword = 1, s0_loadHintSelMask need overturn
     val s0_loadHintSelMask = Mux(
@@ -420,26 +437,22 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val s0_hintSelValid = ParallelORR(s0_loadHintSelMask)
 
   // wake up cache missed load
-  (0 until LoadQueueReplaySize).foreach(i => {
-    when(s0_loadHintWakeMask(i)) {
-      blocking(i) := false.B
-    }
-  })
+  meta.camWrite(l2HintWake, io.l2_hint, blockingField, false.B)
 
   // generate replay mask
   // replay select priority is given as follow
   // 1. hint wake up load
   // 2. higher priority load
   // 3. lower priority load
-  val s0_loadHigherPriorityReplaySelMask = VecInit((0 until LoadQueueReplaySize).map(i => {
-    val hasHigherPriority = cause(i)(LoadReplayCauses.C_DM) || cause(i)(LoadReplayCauses.C_FF)
-    allocated(i) && !scheduled(i) && !blocking(i) && hasHigherPriority
-  })).asUInt // use uint instead vec to reduce verilog lines
+  val s0_loadHigherPriorityReplaySelMask = VecInit(meta.camHitVec((entry: LoadReplayMeta, _: Unit) => {
+    val hasHigherPriority = entry.cause(LoadReplayCauses.C_DM) || entry.cause(LoadReplayCauses.C_FF)
+    entry.allocated && !entry.scheduled && !entry.blocking && hasHigherPriority
+  }, ())).asUInt // use uint instead vec to reduce verilog lines
   val s0_remLoadHigherPriorityReplaySelMask = VecInit((0 until LoadPipelineWidth).map(rem => getRemBits(s0_loadHigherPriorityReplaySelMask)(rem)))
-  val s0_loadLowerPriorityReplaySelMask = VecInit((0 until LoadQueueReplaySize).map(i => {
-    val hasLowerPriority = !cause(i)(LoadReplayCauses.C_DM) && !cause(i)(LoadReplayCauses.C_FF)
-    allocated(i) && !scheduled(i) && !blocking(i) && hasLowerPriority
-  })).asUInt // use uint instead vec to reduce verilog lines
+  val s0_loadLowerPriorityReplaySelMask = VecInit(meta.camHitVec((entry: LoadReplayMeta, _: Unit) => {
+    val hasLowerPriority = !entry.cause(LoadReplayCauses.C_DM) && !entry.cause(LoadReplayCauses.C_FF)
+    entry.allocated && !entry.scheduled && !entry.blocking && hasLowerPriority
+  }, ())).asUInt // use uint instead vec to reduce verilog lines
   val s0_remLoadLowerPriorityReplaySelMask = VecInit((0 until LoadPipelineWidth).map(rem => getRemBits(s0_loadLowerPriorityReplaySelMask)(rem)))
   val s0_loadNormalReplaySelMask = s0_loadLowerPriorityReplaySelMask | s0_loadHigherPriorityReplaySelMask | s0_loadHintSelMask
   val s0_remNormalReplaySelVec = VecInit((0 until LoadPipelineWidth).map(rem => s0_remLoadLowerPriorityReplaySelMask(rem) | s0_remLoadHigherPriorityReplaySelMask(rem) | s0_remLoadHintSelMask(rem)))
@@ -507,6 +520,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   val replay_req = Wire(Vec(LoadPipelineWidth, DecoupledIO(new LsPipelineBundle)))
 
   val s1_payload = s1_oldestSel.map(sel => payload.read(sel.bits))
+  val s1_meta = s1_oldestSel.map(sel => meta.read(sel.bits))
   for (i <- 0 until LoadPipelineWidth) {
     val s0_can_go = s1_can_go(i) ||
                     s1_payload(i).uop.robIdx.needFlush(io.redirect) ||
@@ -517,7 +531,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
 
     for (j <- 0 until LoadQueueReplaySize) {
       when (s0_can_go && s0_oldestSel(i).valid && s0_oldestSelIndexOH(j)) {
-        scheduled(j) := true.B
+        meta.writeField(j.U, scheduledField, true.B)
       }
     }
   }
@@ -538,11 +552,11 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
     val s1_replayIdx = s1_oldestSel(i).bits
     val s2_replayUop = RegEnable(s1_payload(i).uop, s1_can_go(i))
     val s2_vecReplay = RegEnable(s1_payload(i).vecReplay, s1_can_go(i))
-    val s2_replayMSHRId = RegEnable(missMSHRId(s1_replayIdx), s1_can_go(i))
-    val s2_replacementUpdated = RegEnable(replacementUpdated(s1_replayIdx), s1_can_go(i))
-    val s2_missDbUpdated = RegEnable(missDbUpdated(s1_replayIdx), s1_can_go(i))
-    val s2_replayCauses = RegEnable(cause(s1_replayIdx), s1_can_go(i))
-    val s2_replayCarry = RegEnable(replayCarryReg(s1_replayIdx), s1_can_go(i))
+    val s2_replayMSHRId = RegEnable(s1_meta(i).missMSHRId, s1_can_go(i))
+    val s2_replacementUpdated = RegEnable(s1_meta(i).replacementUpdated, s1_can_go(i))
+    val s2_missDbUpdated = RegEnable(s1_meta(i).missDbUpdated, s1_can_go(i))
+    val s2_replayCauses = RegEnable(s1_meta(i).cause, s1_can_go(i))
+    val s2_replayCarry = RegEnable(s1_meta(i).replayCarry, s1_can_go(i))
     val s2_replayCacheMissReplay = RegEnable(trueCacheMissReplay(s1_replayIdx), s1_can_go(i))
     s2_cancelReplay(i) := s2_replayUop.robIdx.needFlush(io.redirect)
 
@@ -642,8 +656,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       freeList.io.doAllocate(w) := !enq.bits.isLoadReplay
 
       //  Allocate new entry
-      allocated(enqIndex) := true.B
-      scheduled(enqIndex) := false.B
+      meta.writeField(enqIndex, allocatedField, true.B)
+      meta.writeField(enqIndex, scheduledField, false.B)
       val enqPayload = Wire(new LoadReplayPayload)
       enqPayload.uop := enq.bits.uop
       enqPayload.uop.exceptionVec := 0.U.asTypeOf(enq.bits.uop.exceptionVec)
@@ -674,12 +688,12 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       // set flags
       val replayInfo = enq.bits.rep_info
       val dataInLastBeat = replayInfo.last_beat
-      cause(enqIndex) := replayInfo.cause.asUInt
+      meta.writeField(enqIndex, causeField, replayInfo.cause.asUInt)
 
 
       // init
-      blocking(enqIndex)     := true.B
-      strict(enqIndex)       := false.B
+      meta.writeField(enqIndex, blockingField, true.B)
+      meta.writeField(enqIndex, strictField, false.B)
 
       // update blocking pointer
       when (replayInfo.cause(LoadReplayCauses.C_BC) ||
@@ -688,27 +702,27 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
             replayInfo.cause(LoadReplayCauses.C_WF)) {
         // normal case: bank conflict or schedule error or dcache replay
         // can replay next cycle
-        blocking(enqIndex) := false.B
+        meta.writeField(enqIndex, blockingField, false.B)
       }
 
       // special case: tlb miss
       when (replayInfo.cause(LoadReplayCauses.C_TM)) {
-        blocking(enqIndex) := !replayInfo.tlb_full &&
-          !(io.tlb_hint.resp.valid && (io.tlb_hint.resp.bits.id === replayInfo.tlb_id || io.tlb_hint.resp.bits.replay_all))
-        tlbHintId(enqIndex) := replayInfo.tlb_id
+        meta.writeField(enqIndex, blockingField, !replayInfo.tlb_full &&
+          !(io.tlb_hint.resp.valid && (io.tlb_hint.resp.bits.id === replayInfo.tlb_id || io.tlb_hint.resp.bits.replay_all)))
+        meta.writeField(enqIndex, tlbHintIdField, replayInfo.tlb_id)
       }
 
       // special case: dcache miss
       when (replayInfo.cause(LoadReplayCauses.C_DM) && enq.bits.handledByMSHR) {
-        blocking(enqIndex) := !replayInfo.full_fwd && //  dcache miss
+        meta.writeField(enqIndex, blockingField, !replayInfo.full_fwd && //  dcache miss
                               !(io.tl_d_channel.valid && io.tl_d_channel.mshrid === replayInfo.mshr_id) && // no refill in this cycle
-                              !(RegNext(io.tl_d_channel.valid) && RegNext(io.tl_d_channel.mshrid) === replayInfo.mshr_id) // not refill in last cycle
+                              !(RegNext(io.tl_d_channel.valid) && RegNext(io.tl_d_channel.mshrid) === replayInfo.mshr_id)) // not refill in last cycle
       }
 
       // special case: st-ld violation
       when (replayInfo.cause(LoadReplayCauses.C_MA)) {
         dependency.write(enqIndex, replayInfo.addr_inv_sq_idx)
-        strict(enqIndex) := enq.bits.uop.loadWaitStrict
+        meta.writeField(enqIndex, strictField, enq.bits.uop.loadWaitStrict)
       }
 
       // special case: data forward fail
@@ -716,25 +730,24 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
         dependency.write(enqIndex, replayInfo.data_inv_sq_idx)
       }
       // extra info
-      replayCarryReg(enqIndex) := replayInfo.rep_carry
-      replacementUpdated(enqIndex) := enq.bits.replacementUpdated
-      missDbUpdated(enqIndex) := enq.bits.missDbUpdated
+      meta.writeField(enqIndex, replayCarryField, replayInfo.rep_carry)
+      meta.writeField(enqIndex, replacementUpdatedField, enq.bits.replacementUpdated)
+      meta.writeField(enqIndex, missDbUpdatedField, enq.bits.missDbUpdated)
       // update mshr_id only when the load has already been handled by mshr
       when(enq.bits.handledByMSHR) {
-        missMSHRId(enqIndex) := replayInfo.mshr_id
+        meta.writeField(enqIndex, missMSHRIdField, replayInfo.mshr_id)
       }
-      dataInLastBeatReg(enqIndex) := dataInLastBeat
-      //dataInLastBeatReg(enqIndex) := Mux(io.l2_hint.bits.isKeyword, !dataInLastBeat, dataInLastBeat)
+      meta.writeField(enqIndex, dataInLastBeatField, dataInLastBeat)
     }
 
     //
     val schedIndex = enq.bits.schedIndex
     when (enq.valid && enq.bits.isLoadReplay) {
       when (!needReplay(w)) {
-        allocated(schedIndex) := false.B
+        meta.writeField(schedIndex, allocatedField, false.B)
         freeMaskVec(schedIndex) := true.B
       } .otherwise {
-        scheduled(schedIndex) := false.B
+        meta.writeField(schedIndex, scheduledField, false.B)
       }
     }
   }
@@ -760,7 +773,7 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
   for (i <- 0 until LoadQueueReplaySize) {
     needCancel(i) := uop(i).robIdx.needFlush(io.redirect) && allocated(i)
     when (needCancel(i)) {
-      allocated(i) := false.B
+      meta.writeField(i.U, allocatedField, false.B)
       freeMaskVec(i) := true.B
     }
   }
@@ -778,7 +791,8 @@ class LoadQueueReplay(implicit p: Parameters) extends XSModule
       u.uop := uop(i)
     }
   }
-  val lq_match_vec = (debug_vaddr.zip(allocated)).map{case(va, alloc) => alloc && (va === robHeadVaddr.bits)}
+  val lq_match_vec = debugVaddr.camHitVec((addr: UInt, query: UInt) => addr === query, robHeadVaddr.bits)
+    .zip(allocated).map { case (hit, alloc) => alloc && hit }
   val rob_head_lq_match = ParallelOperation(lq_match_vec.zip(uop_wrapper), (a: Tuple2[Bool, XSBundleWithMicroOp], b: Tuple2[Bool, XSBundleWithMicroOp]) => {
     val (a_v, a_uop) = (a._1, a._2)
     val (b_v, b_uop) = (b._1, b._2)
