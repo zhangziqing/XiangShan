@@ -2,8 +2,13 @@
 package IntentionModel
 
 import chisel3.{Bundle, Data, Record, SInt, UInt, Vec}
+import firrtl.AnnotationSeq
+import firrtl.annotations.TargetToken
 import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget, SingleTargetAnnotation}
 import firrtl.options.Unserializable
+import firrtl.options.{Dependency, Phase}
+import firrtl.stage.FirrtlCircuitAnnotation
+import scala.collection.mutable.ArrayBuffer
 import upickle.default.{ReadWriter, macroRW, read, write}
 import utils.QueueModel.FieldOf
 
@@ -399,4 +404,159 @@ private[IntentionModel] final case class StorageWiringAnnotation(
 
 final case class StorageIRAnnotation(json: String) extends NoTargetAnnotation with Unserializable {
   def ir: StorageIR = StorageIRCodec.decode(json)
+}
+
+/** Explicit per-elaboration ownership: IDs restart in a new session. */
+final class StorageIRSession {
+  private var nextId = 0L
+  private val artifacts = ArrayBuffer.empty[StorageIR]
+  private[IntentionModel] def allocate(): StorageId = {
+    val id = StorageId(nextId)
+    nextId = Math.addExact(nextId, 1L)
+    id
+  }
+  private[IntentionModel] def record(ir: StorageIR): Unit = {
+    require(!artifacts.exists(_.id == ir.id), "duplicate storage instance ID")
+    artifacts += ir
+  }
+  def models: Vector[StorageIR] = artifacts.toVector
+}
+
+private[IntentionModel] final case class StorageWritePort(
+  id: OpId, guard: ValueId, index: ValueId, value: ValueId, offset: Int, width: Int
+)
+
+/** Data identities live only here and are released after Stage sealing. */
+final class StorageIRBuilder(
+  val id: StorageId, val entries: Int, val layout: EntryLayout, val initial: InitialState
+) {
+  private final case class Captured(id: ValueId, data: Data, tpe: StorageType, read: Option[OpId])
+  private val captured = ArrayBuffer.empty[Captured]
+  private val ops = ArrayBuffer.empty[StorageOp]
+  private val ports = ArrayBuffer.empty[StorageWritePort]
+  private var closed = false
+  private var sealedIR: Option[StorageIR] = None
+  private def open(): Unit = require(!closed && sealedIR.isEmpty, "storage capture is closed")
+  def isSealed: Boolean = sealedIR.nonEmpty
+  private[IntentionModel] def nextOp: OpId = { open(); OpId(ops.size) }
+  private[IntentionModel] def capture(data: Data, tpe: StorageType, read: Option[OpId] = None): ValueId = {
+    open()
+    require(data.getWidth == StorageLayout.width(tpe), "captured value width mismatch")
+    val value = ValueId(captured.size)
+    captured += Captured(value, data, tpe, read)
+    value
+  }
+  private[IntentionModel] def read(index: ValueId, data: Data, source: SourceLoc): (OpId, ValueId) = {
+    val op = nextOp
+    val result = capture(data, layout.shape, Some(op))
+    ops += ReadOp(op, ops.size, Operand(index), result, source)
+    (op, result)
+  }
+  private[IntentionModel] def write(
+    guard: ValueId, index: ValueId, value: ValueId, path: Option[Vector[FieldStep]], source: SourceLoc
+  ): Unit = {
+    val op = nextOp
+    val (_, offset, width) = path.map(StorageLayout.field(layout, _)).getOrElse((layout.shape, 0, layout.totalWidth))
+    ops += (path match {
+      case Some(p) => WriteFieldOp(op, ops.size, Operand(guard), Operand(index), p, Operand(value), source)
+      case None => WriteOp(op, ops.size, Operand(guard), Operand(index), Operand(value), source)
+    })
+    ports += StorageWritePort(op, guard, index, value, offset, width)
+  }
+  private[IntentionModel] def writes: Vector[StorageWritePort] = ports.toVector
+  private[IntentionModel] def data(id: ValueId): Data = captured(id.value).data
+  private[IntentionModel] def closeCapture(): Unit = { open(); closed = true }
+
+  /** Called explicitly by the Stage annotation conversion after elaboration. */
+  def seal(
+    instancePath: String, clock: SignalRef, reset: ResetSpec, resolve: Data => SignalRef
+  ): StorageIR = sealedIR.getOrElse {
+    require(closed, "close capture before sealing")
+    val values = captured.map { c =>
+      val binding = c.read match {
+        case Some(op) => ReadResultValue(op, resolve(c.data))
+        case None => c.data.litOption match {
+          case Some(bits) => ConstantValue(bits & StorageLayout.mask(StorageLayout.width(c.tpe)))
+          case None => SignalValue(resolve(c.data))
+        }
+      }
+      StorageValue(c.id, c.tpe, binding)
+    }.toVector
+    val ir = StorageIR(1, id, Some(instancePath), entries, layout, clock, reset, initial,
+      values, Vector.empty, ops.toVector)
+    StorageIRValidation.requireDPI(ir)
+    sealedIR = Some(ir)
+    captured.clear()
+    ops.clear()
+    ports.clear()
+    ir
+  }
+}
+
+/** Lift only explicitly annotated capture declarations, preserving guarded connects.
+  * This runs on elaborated FIRRTL, before CIRCT; it never recognizes storage patterns.
+  */
+class StorageCapturePhase extends Phase {
+  import firrtl.ir.{UIntType => FirrtlUIntType, _}
+  import xiangshan.transforms.Helpers._
+
+  override def prerequisites = Seq(Dependency[chisel3.stage.phases.Convert])
+  override def optionalPrerequisiteOf = Seq(Dependency[circt.stage.phases.CIRCT])
+  override def invalidates(a: Phase): Boolean = false
+
+  override def transform(annotations: AnnotationSeq): AnnotationSeq = {
+    val wiring = annotations.collect { case a: StorageWiringAnnotation => a }
+    if (wiring.isEmpty) return annotations
+    val byModule = wiring.groupBy(_.module)
+    def expression(target: ReferenceTarget, owner: String): Expression = {
+      require(target.module == owner && target.path.size <= 1, "nonlocal storage capture target")
+      val root: Expression = target.path.headOption match {
+        case Some((instance, _)) => SubField(Reference(instance.value), target.ref)
+        case None => Reference(target.ref)
+      }
+      target.component.foldLeft(root) {
+        case (e, TargetToken.Field(name)) => SubField(e, name)
+        case (e, TargetToken.Index(index)) => SubIndex(e, index, UnknownType)
+        case _ => throw new IllegalArgumentException("unsupported storage target component")
+      }
+    }
+    val circuits = annotations.collect { case c: FirrtlCircuitAnnotation => c }
+    require(circuits.size == 1, "storage capture requires one elaborated circuit")
+    val seen = scala.collection.mutable.Set.empty[String]
+    def module(m: DefModule): DefModule = m match {
+      case mod: Module if byModule.contains(mod.name) =>
+        seen += mod.name
+        val captures = byModule(mod.name)
+        val wires = captures.flatMap(_.wires).toSet
+        val instances = captures.flatMap(_.instances).toSet
+        val declarations = scala.collection.mutable.ArrayBuffer.empty[Statement]
+        val foundWires = scala.collection.mutable.Set.empty[String]
+        val foundInstances = scala.collection.mutable.Set.empty[String]
+        def lift(s: Statement): Statement = s match {
+          case w: DefWire if wires(w.name) =>
+            require(w.tpe.isInstanceOf[FirrtlUIntType], "storage capture wires must be packed UInt")
+            declarations += w; foundWires += w.name; EmptyStmt
+          case i: DefInstance if instances(i.name) =>
+            declarations += i; foundInstances += i.name; EmptyStmt
+          case other => other.mapStmt(lift)
+        }
+        val body = lift(mod.body)
+        require(foundWires.toSet == wires && foundInstances.toSet == instances, "missing storage capture anchors")
+        val defaults = foundWires.toVector.sorted.map(name => ReferenceTarget(
+          circuits.head.circuit.main, mod.name, Seq.empty, name, Seq.empty)) ++ captures.flatMap(_.defaults)
+        val zero = defaults.map(t => Connect(NoInfo, expression(t, mod.name), UIntLiteral(0, IntWidth(1))))
+        val connections = captures.flatMap(_.connections).map { case (sink, source) =>
+          Connect(NoInfo, expression(sink, mod.name), expression(source, mod.name))
+        }
+        mod.copy(body = Block(declarations.toVector ++ zero ++ Vector(body) ++ connections))
+      case other => other
+    }
+    val updated = circuits.head.copy(circuit = circuits.head.circuit.mapModule(module))
+    require(seen.toSet == byModule.keySet, "unresolved storage module anchor")
+    annotations.flatMap {
+      case _: FirrtlCircuitAnnotation => Seq(updated)
+      case _: StorageWiringAnnotation => Seq.empty
+      case other => Seq(other)
+    }
+  }
 }
