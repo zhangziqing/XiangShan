@@ -4,12 +4,15 @@ package IntentionModel
 import chisel3.Data._
 import chisel3._
 import chisel3.experimental.{annotate, ChiselAnnotation}
+import chisel3.stage.ChiselGeneratorAnnotation
 import chisel3.util.HasBlackBoxInline
+import circt.stage.FirtoolOption
 import firrtl.annotations.Annotation
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import scala.collection.immutable.ListMap
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 import utils.QueueModel.{FieldOf, Storage}
 
 /** Directly instantiated software storage within a StorageModelOwner module.
@@ -446,5 +449,54 @@ object StorageDPIEmitter {
     models.foreach(ir => Files.write(directory.resolve(s"storage-${ir.id.value}.json"),
       StorageIRCodec.encode(ir).getBytes(UTF_8)))
     Files.write(directory.resolve("storage_dpi.cpp"), source.getBytes(UTF_8))
+  }
+}
+
+/** Validate generated artifacts or regenerate C++ from saved JSON descriptors. */
+object StorageDescriptorMain {
+  def main(args: Array[String]): Unit = {
+    require(args.length == 2 && Set("--check", "--emit")(args(0)),
+      "Usage: StorageDescriptorMain (--check|--emit) <generated-src-directory>")
+    val directory = Paths.get(args(1))
+    val stream = Files.newDirectoryStream(directory, "storage-*.json")
+    val files = try stream.iterator().asScala.toVector.sortBy(_.getFileName.toString) finally stream.close()
+    val decoded = files.map(file => file -> StorageIRCodec.decode(new String(Files.readAllBytes(file), UTF_8)))
+    decoded.foreach { case (file, model) =>
+      require(file.getFileName.toString == s"storage-${model.id.value}.json", "descriptor filename/ID mismatch")
+    }
+    val models = decoded.map(_._2).sortBy(_.id.value)
+    val expected = StorageDPIEmitter.cpp(models)
+    val source = directory.resolve("storage_dpi.cpp")
+    if (args(0) == "--check") {
+      require(new String(Files.readAllBytes(source), UTF_8) == expected, "generated Storage DPI C++ is stale")
+      println(s"Validated ${models.size} storage descriptors and generated DPI C++")
+    } else {
+      Files.write(source, expected.getBytes(UTF_8))
+      println(s"Generated DPI C++ from ${models.size} storage descriptors")
+    }
+  }
+}
+
+object StorageModelStage {
+  /** Emit RTL and a self-contained generated-src directory for the existing
+    * Difftest build, which discovers generated C++ files and adds their include path.
+    */
+  def emit(
+    generator: StorageIRSession => RawModule,
+    buildDirectory: Path,
+    runtimeHeader: Path = Paths.get("src/test/scala/csrc/storage/storage.hpp")
+  ): Vector[StorageIR] = {
+    require(Files.isRegularFile(runtimeHeader), s"Storage runtime header is missing: $runtimeHeader")
+    val build = buildDirectory.toAbsolutePath.normalize()
+    val session = new StorageIRSession
+    (new top.XiangShanStage).execute(
+      Array("--target", "systemverilog", "--target-dir", build.resolve(".storage-stage").toString),
+      Seq(ChiselGeneratorAnnotation(() => generator(session)), FirtoolOption("--split-verilog"),
+        FirtoolOption(s"-o=${build.resolve("rtl")}")))
+    val models = session.models
+    val generated = build.resolve("generated-src")
+    StorageDPIEmitter.emit(models, generated)
+    Files.copy(runtimeHeader, generated.resolve("storage.hpp"), StandardCopyOption.REPLACE_EXISTING)
+    models
   }
 }
