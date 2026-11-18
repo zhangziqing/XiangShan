@@ -21,6 +21,9 @@ import chisel3.stage._
 import xiangshan.transforms._
 import circt.stage.CLI
 import circt.stage.ChiselStage
+import IntentionModel.{StorageBackendAnnotation, StorageModelStage}
+import firrtl.options.TargetDirAnnotation
+import java.nio.file.Paths
 
 
 class XiangShanStage extends ChiselStage {
@@ -36,6 +39,7 @@ class XiangShanStage extends ChiselStage {
     EnablePrintfAnnotation.addOptions(parser)
     DisableAllPrintAnnotation.addOptions(parser)
     RemoveAssertAnnotation.addOptions(parser)
+    StorageBackendAnnotation.addOptions(parser)
   }
 
   override def run(annotations: firrtl.AnnotationSeq): firrtl.AnnotationSeq = {
@@ -58,7 +62,17 @@ class XiangShanStage extends ChiselStage {
         firrtl.options.Dependency[firrtl.stage.phases.Checks]
       )
     )
-    pm.transform(annotations)
+    val backends = annotations.collect { case a: StorageBackendAnnotation => a }
+    require(backends.size <= 1, "Specify only one storage backend per elaboration")
+    backends.headOption match {
+      case None => pm.transform(annotations)
+      case Some(option) =>
+        val build = annotations.collectFirst { case TargetDirAnnotation(path) => Paths.get(path) }
+          .getOrElse(Paths.get("."))
+        StorageModelStage.withBackend(option, build) { _ =>
+          pm.transform(annotations.filterNot(_.isInstanceOf[StorageBackendAnnotation]))
+        }
+    }
   }
 
 }

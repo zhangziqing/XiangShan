@@ -19,15 +19,14 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
-import utils.QueueModel.{RegStorage, Storage}
+import utils.QueueModel.{Storage, StorageOwner}
 import utility._
 import xiangshan._
 
 class FreeList(
-  size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean = false, moduleName: String = "",
-  storageFactory: (UInt, Int, Option[Seq[UInt]]) => Storage[UInt] =
-    (gen, entries, initial) => new RegStorage(gen, entries, initial)
+  size: Int, allocWidth: Int, freeWidth: Int, enablePreAlloc: Boolean = false, moduleName: String = ""
 )(implicit p: Parameters) extends XSModule
+  with StorageOwner
   with HasCircularQueuePtrHelper
   with HasPerfEvents
 {
@@ -45,7 +44,7 @@ class FreeList(
 
   println(s"FreeList: $moduleName, size " + size)
 
-  private val storage = storageFactory(
+  private val storage = Storage(
     UInt(log2Up(size).W),
     size,
     // originally {0, 1, ..., size - 1} are free.
