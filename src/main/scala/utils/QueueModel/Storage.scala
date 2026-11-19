@@ -44,11 +44,7 @@ abstract class Storage[T <: Data](val entries: Int) {
   def foreach[A <: Data](f: T => A): Seq[A]
 }
 
-/** Register-backed implementation of the Storage contract.
-  * None leaves every field unreset. Initial entries may be partial aggregate
-  * literals: only specified fields reset, with reset taking priority over writes.
-  * Unspecified fields retain their normal write behavior during reset.
-  */
+/** Register-backed implementation of the Storage contract. */
 class RegStorage[T <: Data](
   gen: T,
   entries: Int,
