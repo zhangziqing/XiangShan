@@ -7,16 +7,21 @@ import chisel3.experimental.{annotate, ChiselAnnotation}
 import chisel3.stage.ChiselGeneratorAnnotation
 import chisel3.util.HasBlackBoxInline
 import circt.stage.FirtoolOption
-import firrtl.annotations.Annotation
+import firrtl.annotations.{Annotation, NoTargetAnnotation}
+import firrtl.options.{HasShellOptions, ShellOption, Unserializable}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import scala.collection.immutable.ListMap
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
-import utils.QueueModel.{FieldOf, Storage}
+import utils.QueueModel.{FieldOf, IntentionCallback, Storage}
 
-/** Directly instantiated software storage within a StorageModelOwner module.
-  * StorageModelStage emits RTL and descriptors; RegStorage remains the default.
+/** Software implementation selected by the generation scope for Storage calls.
+  * Bool and AsyncReset inputs are both sampled at the storage clock's rising edge.
+  * Cycle correspondence starts after initialization reset has covered a rising
+  * edge of every storage clock, including gated clocks. Reset-time transactions
+  * and asynchronous pulses between edges are outside this model's contract.
+  * Direct construction remains available for explicit backend verification.
   */
 class ModelStorage[T <: Data](
   gen: T, entries: Int, initContents: Option[Seq[T]] = None,
@@ -25,12 +30,11 @@ class ModelStorage[T <: Data](
   implicit session: StorageIRSession
 ) extends Storage[T](entries) {
   private val owner = Module.currentModule match {
-    case Some(module: StorageModelOwner) => module
-    case _ => throw new IllegalArgumentException("ModelStorage requires a StorageModelOwner module")
+    case Some(module: IntentionCallback) => module
+    case _ => throw new IllegalArgumentException("ModelStorage requires an IntentionCallback module")
   }
   private val clock = Module.clock
   private val reset = Module.reset
-  require(reset.isInstanceOf[Bool], "ModelStorage requires a synchronous Bool reset")
   require(entries > 0, "Storage capacity must be positive")
   private val layout = StorageLayout.fromData(gen)
   require(layout.totalWidth <= 64, "ModelStorage supports entries of at most 64 bits")
@@ -130,11 +134,13 @@ class ModelStorage[T <: Data](
   override final def update(f: T => T): Unit = unsupported("update")
   override final def foreach[A <: Data](f: T => A): Seq[A] = unsupported("foreach")
 
-  owner.registerStorage(() => {
+  owner.registerIntentionCallback(() => {
     val ports = builder.writes
     val widths = ports.map(port => builder.data(port.index).getWidth -> builder.data(port.value).getWidth)
     val cycle = Module(new StorageCycleBridge(builder.id, widths, initial.isInstanceOf[ConstantInitialState]))
     cycle.io.clock := clock
+    // Preserve the source reset type; only the co-sim bridge samples its level.
+    // This deliberately models AsyncReset at clock edges, not at reset edges.
     cycle.io.reset := reset.asBool
     ports.zipWithIndex.foreach { case (port, i) =>
       connections ++= Seq(cycle.io.guard(i) -> builder.data(port.guard),
@@ -161,7 +167,8 @@ class ModelStorage[T <: Data](
       def toFirrtl: Annotation = {
         val ir = builder.seal(owner.toAbsoluteTarget.serialize,
           SignalRef(clock.toAbsoluteTarget.serialize, UIntType(1)),
-          ResetSpec(SignalRef(reset.toAbsoluteTarget.serialize, UIntType(1)), true, true),
+          ResetSpec(SignalRef(reset.toAbsoluteTarget.serialize, UIntType(1)),
+            synchronous = true, activeHigh = true),
           data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)))
         session.record(ir)
         StorageIRAnnotation(StorageIRCodec.encode(ir))
@@ -170,16 +177,10 @@ class ModelStorage[T <: Data](
   })
 }
 
-/** Opt-in lifecycle for directly instantiated software storage in this module.
-  * Registration may occur in a superclass constructor, before this trait's body.
+/** Compatibility alias for explicitly constructed synchronous software models.
+  * Backend-independent modules use IntentionCallback and the Storage declaration.
   */
-trait StorageModelOwner extends Module with RequireSyncReset {
-  private lazy val storageModels = ArrayBuffer.empty[() => Unit]
-  private[IntentionModel] final def registerStorage(finish: () => Unit): Unit =
-    storageModels += finish
-
-  atModuleBodyEnd { storageModels.foreach(_()) }
-}
+trait StorageModelOwner extends RequireSyncReset with IntentionCallback
 
 sealed trait StorageReadBridgeMode
 object StorageReadBridgeMode {
@@ -303,6 +304,7 @@ class StorageCycleIO(widths: Vector[(Int, Int)]) extends Record {
 
 /** Computes an unpublished state version at the edge; NBA switches read visibility.
   * Reads using the old epoch remain stable until downstream registers sample.
+  * Reset is sampled only at a clock edge, even when its source is asynchronous.
   */
 class StorageCycleBridge(storageId: StorageId, widths: Vector[(Int, Int)], initialized: Boolean)
   extends BlackBox with HasBlackBoxInline {
@@ -421,6 +423,7 @@ object StorageDPIEmitter {
          |}""".stripMargin
     }.mkString("\n")
     s"""// Generated from storage IR schema 1. Do not edit.
+       |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
        |$storageModels
@@ -477,14 +480,90 @@ object StorageDescriptorMain {
   }
 }
 
+sealed trait StorageBackend
+object StorageBackend {
+  case object RTL extends StorageBackend
+  /** Clock-sampled reset semantics; accepts Bool and AsyncReset source signals. */
+  final case class CoSim(readBridge: StorageReadBridgeMode = StorageReadBridgeMode.PerRead) extends StorageBackend
+
+  def parse(value: String): StorageBackend = value match {
+    case "rtl" => RTL
+    case "cosim" => CoSim()
+    case _ => throw new IllegalArgumentException("Storage backend must be rtl or cosim")
+  }
+}
+
+/** One option for all Storage declarations in an elaboration. */
+final case class StorageBackendAnnotation(
+  backend: StorageBackend,
+  runtimeHeader: String = "src/test/scala/csrc/storage/storage.hpp"
+) extends NoTargetAnnotation with Unserializable
+
+object StorageBackendAnnotation extends HasShellOptions {
+  val options = Seq(new ShellOption[String](
+    longOption = "storage-backend",
+    toAnnotationSeq = value => Seq(StorageBackendAnnotation(StorageBackend.parse(value))),
+    helpText = "Select the backend for every Storage declaration (default: rtl)",
+    helpValueName = Some("rtl|cosim")
+  ))
+}
+
 object StorageModelStage {
-  /** Emit RTL and a self-contained generated-src directory for the existing
-    * Difftest build, which discovers generated C++ files and adds their include path.
+  private val defaultRuntime = Paths.get("src/test/scala/csrc/storage/storage.hpp")
+
+  /** Generate the same module source for either target. The stage owns the
+    * backend scope, session, instance IDs and software artifact emission.
     */
+  def emit(
+    generator: () => RawModule,
+    buildDirectory: Path,
+    backend: StorageBackend = StorageBackend.RTL,
+    runtimeHeader: Path = defaultRuntime
+  ): Vector[StorageIR] = {
+    val build = buildDirectory.toAbsolutePath.normalize()
+    withBackend(StorageBackendAnnotation(backend, runtimeHeader.toString), build) { session =>
+      (new top.XiangShanStage).execute(
+        Array("--target", "systemverilog", "--target-dir", build.toString),
+        Seq(ChiselGeneratorAnnotation(generator), FirtoolOption("--split-verilog"),
+          FirtoolOption(s"-o=${build.resolve("rtl")}")))
+      session.models
+    }
+  }
+
+  private[IntentionModel] def artifacts(models: Vector[StorageIR], build: Path, runtimeHeader: Path): Unit = {
+    val generated = build.resolve("generated-src")
+    StorageDPIEmitter.emit(models, generated)
+    Files.copy(runtimeHeader, generated.resolve("storage.hpp"), StandardCopyOption.REPLACE_EXISTING)
+  }
+
+  /** Called around the complete stage pipeline so conversion seals the same
+    * session that allocated all nested storage instances.
+    */
+  def withBackend[A](option: StorageBackendAnnotation, build: Path)(generate: StorageIRSession => A): A = {
+    val session = new StorageIRSession
+    val implementation = option.backend match {
+      case StorageBackend.RTL => Storage.RTL
+      case StorageBackend.CoSim(readBridge) =>
+        require(Files.isRegularFile(Paths.get(option.runtimeHeader)),
+          s"Storage runtime header is missing: ${option.runtimeHeader}")
+        new Storage.Backend {
+          def apply[T <: Data](gen: T, entries: Int, initial: Option[Seq[T]]): Storage[T] =
+            new ModelStorage(gen, entries, initial, readBridge)(session)
+        }
+    }
+    val result = Storage.withBackend(implementation)(generate(session))
+    if (option.backend != StorageBackend.RTL) artifacts(session.models, build, Paths.get(option.runtimeHeader))
+    result
+  }
+
+  /** Compatibility entry point for explicitly instantiated ModelStorage. */
+  def emit(generator: StorageIRSession => RawModule, buildDirectory: Path): Vector[StorageIR] =
+    emit(generator, buildDirectory, defaultRuntime)
+
   def emit(
     generator: StorageIRSession => RawModule,
     buildDirectory: Path,
-    runtimeHeader: Path = Paths.get("src/test/scala/csrc/storage/storage.hpp")
+    runtimeHeader: Path
   ): Vector[StorageIR] = {
     require(Files.isRegularFile(runtimeHeader), s"Storage runtime header is missing: $runtimeHeader")
     val build = buildDirectory.toAbsolutePath.normalize()
@@ -494,9 +573,7 @@ object StorageModelStage {
       Seq(ChiselGeneratorAnnotation(() => generator(session)), FirtoolOption("--split-verilog"),
         FirtoolOption(s"-o=${build.resolve("rtl")}")))
     val models = session.models
-    val generated = build.resolve("generated-src")
-    StorageDPIEmitter.emit(models, generated)
-    Files.copy(runtimeHeader, generated.resolve("storage.hpp"), StandardCopyOption.REPLACE_EXISTING)
+    artifacts(models, build, runtimeHeader)
     models
   }
 }

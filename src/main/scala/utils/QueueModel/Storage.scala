@@ -4,6 +4,7 @@ package utils.QueueModel
 import chisel3._
 import chisel3.Data._
 import chisel3.util.{Mux1H, PopCount, log2Ceil}
+import scala.util.DynamicVariable
 
 /** Physical-entry access contract, independent of queue membership. */
 abstract class Storage[T <: Data](val entries: Int) {
@@ -42,6 +43,33 @@ abstract class Storage[T <: Data](val entries: Int) {
     * The result has `entries` elements; pending writes are not forwarded.
     */
   def foreach[A <: Data](f: T => A): Seq[A]
+}
+
+/** Module-body completion callbacks for intention capture, preserving reset inference. */
+trait IntentionCallback { this: Module =>
+  final def registerIntentionCallback(finish: () => Unit): Unit =
+    atModuleBodyEnd { finish() }
+}
+
+/** One source-level declaration; the generation scope selects its implementation. */
+object Storage {
+  trait Backend {
+    def apply[T <: Data](gen: T, entries: Int, initial: Option[Seq[T]]): Storage[T]
+  }
+  object RTL extends Backend {
+    def apply[T <: Data](gen: T, entries: Int, initial: Option[Seq[T]]): Storage[T] =
+      new RegStorage(gen, entries, initial)
+  }
+  private val backend = new DynamicVariable[Backend](RTL)
+
+  /** The scope covers the entire elaboration, including nested modules. It is
+    * restored on both success and failure; no process-wide backend is retained.
+    */
+  def withBackend[A](implementation: Backend)(generate: => A): A =
+    backend.withValue(implementation)(generate)
+
+  def apply[T <: Data](gen: T, entries: Int, initial: Option[Seq[T]] = None): Storage[T] =
+    backend.value(gen, entries, initial)
 }
 
 /** Register-backed implementation of the Storage contract. */
