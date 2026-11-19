@@ -20,6 +20,7 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.RegStorage
 import utility._
 import xiangshan._
 import xiangshan.ExceptionNO._
@@ -67,16 +68,17 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   //  MicroOp     : inst's microOp
   //  Flags       : load flags
   val allocated = RegInit(VecInit(List.fill(VirtualLoadQueueSize)(false.B))) // The control signals need to explicitly indicate the initial value
-  val robIdx = Reg(Vec(VirtualLoadQueueSize, new RobPtr))
-  val uopIdx = Reg(Vec(VirtualLoadQueueSize, UopIdx()))
-  val isvec = RegInit(VecInit(List.fill(VirtualLoadQueueSize)(false.B))) // vector load flow
-  val committed = Reg(Vec(VirtualLoadQueueSize, Bool()))
+  val robIdx = new RegStorage[RobPtr](new RobPtr, VirtualLoadQueueSize)
+  val uopIdx = new RegStorage[UInt](UopIdx(), VirtualLoadQueueSize)
+  val isvec = new RegStorage[Bool](Bool(), VirtualLoadQueueSize,
+    Some(Seq.fill(VirtualLoadQueueSize)(false.B))) // vector load flow
+  val committed = new RegStorage[Bool](Bool(), VirtualLoadQueueSize)
 
   /**
    * used for debug
    */
-  val debug_mmio = Reg(Vec(VirtualLoadQueueSize, Bool())) // mmio: inst is an mmio inst
-  val debug_paddr = Reg(Vec(VirtualLoadQueueSize, UInt(PAddrBits.W))) // mmio: inst's paddr
+  val debug_mmio = new RegStorage[Bool](Bool(), VirtualLoadQueueSize) // mmio: inst is an mmio inst
+  val debug_paddr = new RegStorage[UInt](UInt(PAddrBits.W), VirtualLoadQueueSize) // mmio: inst's paddr
 
   //  maintain pointers
   val enqPtrExt = RegInit(VecInit((0 until io.enq.req.length).map(_.U.asTypeOf(new LqPtr))))
@@ -95,7 +97,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   val canEnqueue = io.enq.req.map(_.valid)
   val vLoadFlow = io.enq.req.map(_.bits.numLsElem.asTypeOf(UInt(elemIdxBits.W)))
   val needCancel = WireInit(VecInit((0 until VirtualLoadQueueSize).map(i => {
-    robIdx(i).needFlush(io.redirect) && allocated(i)
+    robIdx.read(i).needFlush(io.redirect) && allocated(i)
   })))
   val lastNeedCancel = GatedValidRegNext(needCancel)
   val enqCancel = canEnqueue.zip(io.enq.req).map{case (v , x) =>
@@ -135,7 +137,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   val DeqPtrMoveStride = CommitWidth
   require(DeqPtrMoveStride == CommitWidth, "DeqPtrMoveStride must be equal to CommitWidth!")
   val deqLookupVec = VecInit((0 until DeqPtrMoveStride).map(deqPtr + _.U))
-  val deqLookup = VecInit(deqLookupVec.map(ptr => allocated(ptr.value) && committed(ptr.value) && ptr =/= enqPtrExt(0)))
+  val deqLookup = VecInit(deqLookupVec.map(ptr => allocated(ptr.value) && committed.read(ptr.value) && ptr =/= enqPtrExt(0)))
   val deqInSameRedirectCycle = VecInit(deqLookupVec.map(ptr => needCancel(ptr.value)))
   // make chisel happy
   val deqCountMask = Wire(UInt(DeqPtrMoveStride.W))
@@ -155,8 +157,8 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   io.ldWbPtr := deqPtr
   io.lqEmpty := RegNext(validCount === 0.U)
 
-  io.lqDeqRobIdx := robIdx(deqPtr.value)
-  io.lqDeqUopIdx := uopIdx(deqPtr.value)
+  io.lqDeqRobIdx := robIdx.read(deqPtr.value)
+  io.lqDeqUopIdx := uopIdx.read(deqPtr.value)
 
   /**
    * Enqueue at dispatch
@@ -182,13 +184,13 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
     val selectBits = ParallelPriorityMux(entryCanEnqSeq, io.enq.req.map(_.bits))
     when (entryCanEnq) {
       allocated(i) := true.B
-      robIdx(i) := selectBits.robIdx
-      uopIdx(i) := selectBits.uopIdx
-      isvec(i) :=  FuType.isVLoad(selectBits.fuType)
-      committed(i) := false.B
+      robIdx.write(i.U, selectBits.robIdx)
+      uopIdx.write(i.U, selectBits.uopIdx)
+      isvec.write(i.U, FuType.isVLoad(selectBits.fuType))
+      committed.write(i.U, false.B)
 
-      debug_mmio(i) := false.B
-      debug_paddr(i) := 0.U
+      debug_mmio.write(i.U, false.B)
+      debug_paddr.write(i.U, 0.U)
     }
   }
 
@@ -218,12 +220,12 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   for (i <- 0 until VirtualLoadQueueSize) {
     val cmt = io.vecCommit
     for (j <- 0 until VecLoadPipelineWidth) {
-      vecLdCommittmp(i)(j) := allocated(i) && cmt(j).valid && robIdx(i) === cmt(j).bits.robidx && uopIdx(i) === cmt(j).bits.uopidx
+      vecLdCommittmp(i)(j) := allocated(i) && cmt(j).valid && robIdx.read(i) === cmt(j).bits.robidx && uopIdx.read(i) === cmt(j).bits.uopidx
     }
     vecLdCommit(i) := vecLdCommittmp(i).reduce(_ || _)
 
-    when (vecLdCommit(i) && isvec(i)) {
-      committed(i) := true.B
+    when (vecLdCommit(i) && isvec.read(i)) {
+      committed.write(i.U, true.B)
     }
   }
 
@@ -255,10 +257,10 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
     when (io.ldin(i).valid) {
       val hasExceptions = ExceptionNO.selectByFu(io.ldin(i).bits.uop.exceptionVec, LduCfg).asUInt.orR
       when (!need_rep && need_valid && !io.ldin(i).bits.isvec) {
-        committed(loadWbIndex) := true.B
+        committed.write(loadWbIndex, true.B)
         //  Debug info
-        debug_mmio(loadWbIndex) := io.ldin(i).bits.mmio
-        debug_paddr(loadWbIndex) := io.ldin(i).bits.paddr
+        debug_mmio.write(loadWbIndex, io.ldin(i).bits.mmio)
+        debug_paddr.write(loadWbIndex, io.ldin(i).bits.paddr)
       }
     }
     XSInfo(io.ldin(i).valid && !need_rep && need_valid,
@@ -277,7 +279,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
 
   //  perf counter
   QueuePerf(VirtualLoadQueueSize, validCount, !allowEnqueue)
-  val vecValidVec = WireInit(VecInit((0 until VirtualLoadQueueSize).map(i => allocated(i) && isvec(i))))
+  val vecValidVec = WireInit(VecInit((0 until VirtualLoadQueueSize).map(i => allocated(i) && isvec.read(i))))
   QueuePerf(VirtualLoadQueueSize, PopCount(vecValidVec), !allowEnqueue)
   io.lqFull := !allowEnqueue
 
@@ -294,8 +296,8 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
 
   for (i <- 0 until VirtualLoadQueueSize) {
     PrintFlag(allocated(i), "a")
-    PrintFlag(allocated(i) && committed(i), "c")
-    PrintFlag(allocated(i) && isvec(i), "v")
+    PrintFlag(allocated(i) && committed.read(i), "c")
+    PrintFlag(allocated(i) && isvec.read(i), "v")
     XSDebug(false, true.B, "\n")
   }
   // end
