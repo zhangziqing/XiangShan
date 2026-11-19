@@ -20,6 +20,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
+import utils.QueueModel.{FieldOf, RegStorage}
 import utility._
 import xiangshan._
 import xiangshan.backend.rob.RobPtr
@@ -165,9 +166,10 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   // buffer uop
   val instMicroOp       = Reg(new VSegmentBundle)
   val instMicroOpValid  = RegInit(false.B)
-  val data              = Reg(Vec(maxSize, UInt(VLEN.W)))
-  val uopq              = Reg(Vec(maxSize, new VSegmentUop))
-  val stride            = Reg(Vec(maxSize, UInt(VLEN.W)))
+  val data              = new RegStorage[UInt](UInt(VLEN.W), maxSize)
+  val uopq              = new RegStorage[VSegmentUop](new VSegmentUop, maxSize)
+  val stride            = new RegStorage[UInt](UInt(VLEN.W), maxSize)
+  private val uopField  = FieldOf(new VSegmentUop)(_.uop)
   val allocated         = RegInit(VecInit(Seq.fill(maxSize)(false.B)))
   val enqPtr            = RegInit(0.U.asTypeOf(new VSegUPtr))
   val deqPtr            = RegInit(0.U.asTypeOf(new VSegUPtr))
@@ -403,9 +405,9 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   }
   // latch data
   when(io.in.fire && !isEnqFixVlUop){
-    data(enqPtr.value)                := io.in.bits.src_vs3
-    stride(enqPtr.value)              := io.in.bits.src_stride
-    uopq(enqPtr.value).uop            := io.in.bits.uop
+    data.write(enqPtr.value, io.in.bits.src_vs3)
+    stride.write(enqPtr.value, io.in.bits.src_stride)
+    uopq.writeField(enqPtr.value, uopField, io.in.bits.uop)
   }
 
   // update enqptr, only 1 port
@@ -418,7 +420,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
    *************************************************************************/
 
   val indexStride                     = IndexAddr( // index for indexed instruction
-                                                    index = stride(stridePtrReg.value),
+                                                    index = stride.read(stridePtrReg.value),
                                                     flow_inner_idx = issueIndexIdx,
                                                     eew = issueEew
                                                   )
@@ -665,14 +667,14 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   val mergemisalignData = Mux(notCross16ByteReg, shiftData, combinedData)
   val pickData  = rdataVecHelper(alignedType(1,0), Mux(isMisalignReg, mergemisalignData, cacheData))
   val mergedData = mergeDataWithElemIdx(
-    oldData = data(splitPtr.value),
+    oldData = data.read(splitPtr.value),
     newData = Seq(pickData),
     alignedType = alignedType(1,0),
     elemIdx = Seq(elemIdxInVd),
     valids = Seq(true.B)
   )
   when(state === s_latch_and_merge_data && segmentActive){
-    data(splitPtr.value) := mergedData
+    data.write(splitPtr.value, mergedData)
   }
 
 
@@ -680,7 +682,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
    * split data for store
    * */
   val splitData = genVSData(
-    data = data(splitPtr.value),
+    data = data.read(splitPtr.value),
     elemIdx = elemIdxInVd,
     alignedType = alignedType
   )
@@ -776,7 +778,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   )
 
   io.vecDifftestInfo.valid         := io.sbuffer.valid
-  io.vecDifftestInfo.bits.uop      := uopq(deqPtr.value).uop
+  io.vecDifftestInfo.bits.uop      := uopq.read(deqPtr.value).uop
   io.vecDifftestInfo.bits.start    := 0.U // only use in no-segment unit-stride
   io.vecDifftestInfo.bits.offset   := 0.U
 
@@ -865,7 +867,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   when((fieldIdx === maxNfields && (state === s_latch_and_merge_data || (state === s_send_data && stateNext =/= s_send_data && fieldActiveWirteFinish))) ||
        segmentInactiveFinish){
 
-    segmentOffset := segmentOffset + Mux(isUnitStride(issueInstType), (maxNfields +& 1.U) << issueEew(1, 0), stride(stridePtr.value))
+    segmentOffset := segmentOffset + Mux(isUnitStride(issueInstType), (maxNfields +& 1.U) << issueEew(1, 0), stride.read(stridePtr.value))
   }
 
 
@@ -893,7 +895,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   /*************************************************************************
    *                            dequeue logic
    *************************************************************************/
-  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), uopq(deqPtr.value).uop.vpu.vuopIdx)
+  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), uopq.read(deqPtr.value).uop.vpu.vuopIdx)
   /*select mask of vd, maybe remove in feature*/
   val realEw        = Mux(isIndexed(issueInstType), issueSew(1, 0), issueEew(1, 0))
   val maskDataVec: Vec[UInt] = VecDataToMaskDataVec(instMicroOp.mask, realEw)
@@ -913,17 +915,17 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
     writebackOut.mask.get               := Fill(VLEN, 1.U)
     writebackOut.uop.vpu.vmask          := Fill(VLEN, 1.U)
   }.otherwise{
-    writebackOut.uop                    := uopq(deqPtr.value).uop
+    writebackOut.uop                    := uopq.read(deqPtr.value).uop
     writebackOut.uop.vpu                := instMicroOp.uop.vpu
     writebackOut.uop.trigger            := instMicroOp.uop.trigger
     writebackOut.uop.exceptionVec       := instMicroOp.uop.exceptionVec
     writebackOut.mask.get               := instMicroOp.mask
-    writebackOut.data                   := data(deqPtr.value)
+    writebackOut.data                   := data.read(deqPtr.value)
     writebackOut.vdIdx.get              := vdIdxInField
     writebackOut.uop.vpu.vl             := instMicroOp.vl
     writebackOut.uop.vpu.vstart         := Mux(instMicroOp.uop.exceptionVec.asUInt.orR || TriggerAction.isDmode(instMicroOp.uop.trigger), instMicroOp.exceptionVstart, instMicroOp.vstart)
     writebackOut.uop.vpu.vmask          := maskUsed
-    writebackOut.uop.vpu.vuopIdx        := uopq(deqPtr.value).uop.vpu.vuopIdx
+    writebackOut.uop.vpu.vuopIdx        := uopq.read(deqPtr.value).uop.vpu.vuopIdx
     writebackOut.debug                  := DontCare
     writebackOut.vdIdxInField.get       := vdIdxInField
     writebackOut.uop.robIdx             := instMicroOp.uop.robIdx
@@ -943,8 +945,8 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   feedbackOut.sourceType              := DontCare
   feedbackOut.flushState              := DontCare
   feedbackOut.dataInvalidSqIdx        := DontCare
-  feedbackOut.sqIdx                   := uopq(deqPtr.value).uop.sqIdx
-  feedbackOut.lqIdx                   := uopq(deqPtr.value).uop.lqIdx
+  feedbackOut.sqIdx                   := uopq.read(deqPtr.value).uop.sqIdx
+  feedbackOut.lqIdx                   := uopq.read(deqPtr.value).uop.lqIdx
 
   io.feedback.valid                   := RegNext(feedbackValid)
   io.feedback.bits                    := RegEnable(feedbackOut, feedbackValid)
@@ -954,7 +956,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   // exception
   io.exceptionInfo                    := DontCare
   io.exceptionInfo.bits.robidx        := instMicroOp.uop.robIdx
-  io.exceptionInfo.bits.uopidx        := uopq(deqPtr.value).uop.vpu.vuopIdx
+  io.exceptionInfo.bits.uopidx        := uopq.read(deqPtr.value).uop.vpu.vuopIdx
   io.exceptionInfo.bits.vstart        := instMicroOp.exceptionVstart
   io.exceptionInfo.bits.vaddr         := instMicroOp.exceptionVaddr
   io.exceptionInfo.bits.gpaddr        := instMicroOp.exceptionGpaddr
