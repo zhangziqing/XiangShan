@@ -20,7 +20,7 @@ import chisel3._
 import chisel3.experimental.BundleLiterals._
 import chisel3.util._
 import utils._
-import utils.QueueModel.{FieldOf, RegStorage, Storage}
+import utils.QueueModel.{FieldOf, IntentionCallback, Storage}
 import utility._
 import xiangshan._
 import xiangshan.backend.rob.RobPtr
@@ -35,6 +35,7 @@ class LoadQueueRAREntry(implicit p: Parameters) extends XSBundle {
 }
 
 class LoadQueueRAR(implicit p: Parameters) extends XSModule
+  with IntentionCallback
   with HasDCacheParameters
   with HasCircularQueuePtrHelper
   with HasLoadHelper
@@ -104,7 +105,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   //  PAddr       : physical address.
   //  Released    : DCache released.
   // Reset ownership without resetting the originally unreset uop keys.
-  private val entries: Storage[LoadQueueRAREntry] = new RegStorage(
+  private val entries: Storage[LoadQueueRAREntry] = Storage(
     new LoadQueueRAREntry, LoadQueueRARSize,
     Some(Seq.fill(LoadQueueRARSize)((new LoadQueueRAREntry).Lit(_.allocated -> false.B))))
   private val allocatedField = FieldOf(new LoadQueueRAREntry)(_.allocated)
