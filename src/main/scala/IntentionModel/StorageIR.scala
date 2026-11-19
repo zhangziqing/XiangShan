@@ -44,6 +44,10 @@ final case class ConstantValue(bits: BigInt) extends ValueBinding
 final case class ReadResultValue(op: OpId, signal: SignalRef) extends ValueBinding
 final case class StorageValue(id: ValueId, tpe: StorageType, binding: ValueBinding)
 final case class Operand(value: ValueId)
+/** Reset semantics of the executable model, with the source signal's identity.
+  * A clock-sampled model uses synchronous=true even for an AsyncReset source;
+  * this flag describes model timing rather than the source signal's reset type.
+  */
 final case class ResetSpec(signal: SignalRef, synchronous: Boolean, activeHigh: Boolean)
 sealed trait InitialState
 case object UnspecifiedInitialState extends InitialState
@@ -371,7 +375,7 @@ object StorageIRValidation {
   def requireDPI(ir: StorageIR): Unit = {
     validate(ir)
     require(ir.entry.totalWidth <= 64, "DPI entry width must be at most 64 bits")
-    require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires synchronous active-high reset")
+    require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
     require(ir.expressions.isEmpty, "callback expression lowering is not implemented")
     ir.operations.foreach {
       case _: ReadOp | _: WriteOp | _: WriteFieldOp => ()

@@ -17,6 +17,10 @@ import scala.jdk.CollectionConverters._
 import utils.QueueModel.{FieldOf, IntentionCallback, Storage}
 
 /** Software implementation selected by the generation scope for Storage calls.
+  * Bool and AsyncReset inputs are both sampled at the storage clock's rising edge.
+  * Cycle correspondence starts after initialization reset has covered a rising
+  * edge of every storage clock, including gated clocks. Reset-time transactions
+  * and asynchronous pulses between edges are outside this model's contract.
   * Direct construction remains available for explicit backend verification.
   */
 class ModelStorage[T <: Data](
@@ -31,7 +35,6 @@ class ModelStorage[T <: Data](
   }
   private val clock = Module.clock
   private val reset = Module.reset
-  require(!reset.isInstanceOf[AsyncReset], "ModelStorage requires a synchronous Bool reset")
   require(entries > 0, "Storage capacity must be positive")
   private val layout = StorageLayout.fromData(gen)
   require(layout.totalWidth <= 64, "ModelStorage supports entries of at most 64 bits")
@@ -136,9 +139,9 @@ class ModelStorage[T <: Data](
     val widths = ports.map(port => builder.data(port.index).getWidth -> builder.data(port.value).getWidth)
     val cycle = Module(new StorageCycleBridge(builder.id, widths, initial.isInstanceOf[ConstantInitialState]))
     cycle.io.clock := clock
-    // A direct Bool connection constrains an inferred Reset to synchronous.
-    // Casting with asBool would silently accept an asynchronous parent reset.
-    cycle.io.reset := reset
+    // Preserve the source reset type; only the co-sim bridge samples its level.
+    // This deliberately models AsyncReset at clock edges, not at reset edges.
+    cycle.io.reset := reset.asBool
     ports.zipWithIndex.foreach { case (port, i) =>
       connections ++= Seq(cycle.io.guard(i) -> builder.data(port.guard),
         cycle.io.index(i) -> builder.data(port.index), cycle.io.value(i) -> builder.data(port.value))
@@ -164,7 +167,8 @@ class ModelStorage[T <: Data](
       def toFirrtl: Annotation = {
         val ir = builder.seal(owner.toAbsoluteTarget.serialize,
           SignalRef(clock.toAbsoluteTarget.serialize, UIntType(1)),
-          ResetSpec(SignalRef(reset.toAbsoluteTarget.serialize, UIntType(1)), true, true),
+          ResetSpec(SignalRef(reset.toAbsoluteTarget.serialize, UIntType(1)),
+            synchronous = true, activeHigh = true),
           data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)))
         session.record(ir)
         StorageIRAnnotation(StorageIRCodec.encode(ir))
@@ -300,6 +304,7 @@ class StorageCycleIO(widths: Vector[(Int, Int)]) extends Record {
 
 /** Computes an unpublished state version at the edge; NBA switches read visibility.
   * Reads using the old epoch remain stable until downstream registers sample.
+  * Reset is sampled only at a clock edge, even when its source is asynchronous.
   */
 class StorageCycleBridge(storageId: StorageId, widths: Vector[(Int, Int)], initialized: Boolean)
   extends BlackBox with HasBlackBoxInline {
@@ -418,6 +423,7 @@ object StorageDPIEmitter {
          |}""".stripMargin
     }.mkString("\n")
     s"""// Generated from storage IR schema 1. Do not edit.
+       |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
        |$storageModels
@@ -477,6 +483,7 @@ object StorageDescriptorMain {
 sealed trait StorageBackend
 object StorageBackend {
   case object RTL extends StorageBackend
+  /** Clock-sampled reset semantics; accepts Bool and AsyncReset source signals. */
   final case class CoSim(readBridge: StorageReadBridgeMode = StorageReadBridgeMode.PerRead) extends StorageBackend
 
   def parse(value: String): StorageBackend = value match {

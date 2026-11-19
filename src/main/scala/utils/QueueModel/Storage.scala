@@ -83,9 +83,9 @@ class RegStorage[T <: Data](
   private val contents: Vec[T] = initContents match {
     case Some(initial) =>
       require(initial.length == entries, "initial contents must describe every storage entry")
-      // Preserve the declared entry type; VecInit otherwise narrows scalar UInts
-      // to the widest initial literal.
-      RegInit(VecInit(initial.map(_.asTypeOf(gen))))
+      // The explicit type preserves entry widths; keep aggregate initializers
+      // structured so omitted literal fields remain unreset.
+      RegInit(Vec(entries, gen), VecInit(initial))
     case None => Reg(Vec(entries, gen))
   }
 
