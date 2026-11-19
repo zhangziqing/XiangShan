@@ -14,7 +14,7 @@ import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import scala.collection.immutable.ListMap
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
-import utils.QueueModel.{FieldOf, Storage, StorageOwner}
+import utils.QueueModel.{FieldOf, IntentionCallback, Storage}
 
 /** Software implementation selected by the generation scope for Storage calls.
   * Direct construction remains available for explicit backend verification.
@@ -26,8 +26,8 @@ class ModelStorage[T <: Data](
   implicit session: StorageIRSession
 ) extends Storage[T](entries) {
   private val owner = Module.currentModule match {
-    case Some(module: StorageOwner) => module
-    case _ => throw new IllegalArgumentException("ModelStorage requires a StorageOwner module")
+    case Some(module: IntentionCallback) => module
+    case _ => throw new IllegalArgumentException("ModelStorage requires an IntentionCallback module")
   }
   private val clock = Module.clock
   private val reset = Module.reset
@@ -131,7 +131,7 @@ class ModelStorage[T <: Data](
   override final def update(f: T => T): Unit = unsupported("update")
   override final def foreach[A <: Data](f: T => A): Seq[A] = unsupported("foreach")
 
-  owner.registerStorage(() => {
+  owner.registerIntentionCallback(() => {
     val ports = builder.writes
     val widths = ports.map(port => builder.data(port.index).getWidth -> builder.data(port.value).getWidth)
     val cycle = Module(new StorageCycleBridge(builder.id, widths, initial.isInstanceOf[ConstantInitialState]))
@@ -174,9 +174,9 @@ class ModelStorage[T <: Data](
 }
 
 /** Compatibility alias for explicitly constructed synchronous software models.
-  * Backend-independent modules use StorageOwner and the Storage declaration.
+  * Backend-independent modules use IntentionCallback and the Storage declaration.
   */
-trait StorageModelOwner extends StorageOwner with RequireSyncReset
+trait StorageModelOwner extends RequireSyncReset with IntentionCallback
 
 sealed trait StorageReadBridgeMode
 object StorageReadBridgeMode {

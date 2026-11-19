@@ -45,9 +45,9 @@ abstract class Storage[T <: Data](val entries: Int) {
   def foreach[A <: Data](f: T => A): Seq[A]
 }
 
-/** Backend-neutral lifecycle, without changing the module's inferred reset type. */
-trait StorageOwner extends Module {
-  final def registerStorage(finish: () => Unit): Unit =
+/** Module-body completion callbacks for intention capture, preserving reset inference. */
+trait IntentionCallback { this: Module =>
+  final def registerIntentionCallback(finish: () => Unit): Unit =
     atModuleBodyEnd { finish() }
 }
 
