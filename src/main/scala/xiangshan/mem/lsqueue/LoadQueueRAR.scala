@@ -19,18 +19,15 @@ import org.chipsalliance.cde.config._
 import chisel3._
 import chisel3.util._
 import utils._
-import utils.QueueModel.{FieldOf, RegStorage, Storage}
+import utils.QueueModel.{RegStorage, Storage}
 import utility._
 import xiangshan._
 import xiangshan.backend.rob.RobPtr
 import xiangshan.mem.Bundles._
 import xiangshan.cache._
 
-/** Ownership and the only uop keys consumed by RAR predicates.
-  * Keys are installed together with allocation and observed only while allocated.
-  */
-class LoadQueueRAREntry(implicit p: Parameters) extends XSBundle {
-  val allocated = Bool()
+/** The only uop keys consumed by RAR predicates, written on allocation. */
+class LoadQueueRARKeys(implicit p: Parameters) extends XSBundle {
   val robIdx = new RobPtr
   val lqIdx = new LqPtr
 }
@@ -104,9 +101,12 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   //  ROB/LQ keys : ordering and writeback predicates.
   //  PAddr       : physical address.
   //  Released    : DCache released.
-  private val entries: Storage[LoadQueueRAREntry] = new RegStorage(new LoadQueueRAREntry, LoadQueueRARSize,
-    Some(Seq.fill(LoadQueueRARSize)(0.U.asTypeOf(new LoadQueueRAREntry))))
-  private val allocatedField = FieldOf(new LoadQueueRAREntry)(_.allocated)
+  // Keep resettable membership separate from the originally unreset uop keys.
+  private val entries: Storage[LoadQueueRARKeys] = new RegStorage(
+    new LoadQueueRARKeys, LoadQueueRARSize, initContents = None)
+  private val allocation: Storage[UInt] = new RegStorage(
+    UInt(LoadQueueRARSize.W), 1, Some(Seq(0.U(LoadQueueRARSize.W))))
+  val allocated = allocation.read(0)
   val paddrModule = Module(new LqPAddrModule(
     gen = UInt(PartialPAddrBits.W),
     numEntries = LoadQueueRARSize,
@@ -175,8 +175,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
 
       freeList.io.doAllocate(w) := true.B
       //  Allocate new entry
-      val entry = Wire(new LoadQueueRAREntry)
-      entry.allocated := true.B
+      val entry = Wire(new LoadQueueRARKeys)
       entry.robIdx := enq.bits.uop.robIdx
       entry.lqIdx := enq.bits.uop.lqIdx
       entries.write(enqIndex, entry)
@@ -196,7 +195,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
     }
     val debug_robIdx = enq.bits.uop.robIdx.asUInt
     XSError(
-      needEnqueue(w) && enq.ready && entries.read(enqIndex).allocated,
+      needEnqueue(w) && enq.ready && allocated(enqIndex),
       p"LoadQueueRAR: You can not write an valid entry! check: ldu $w, robIdx $debug_robIdx")
   }
 
@@ -204,13 +203,14 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   val freeMaskVec = Wire(Vec(LoadQueueRARSize, Bool()))
 
   // Reclaim and report exactly the same current-state matches to FreeList.
-  val canFree = (entry: LoadQueueRAREntry, _: Unit) => {
+  val canFree = entries.camHitVec((entry: LoadQueueRARKeys, _: Unit) => {
     val deqNotBlock = !isBefore(io.ldWbPtr, entry.lqIdx)
     val needFlush = entry.robIdx.needFlush(io.redirect)
-    entry.allocated && (deqNotBlock || needFlush)
-  }
-  freeMaskVec := VecInit(entries.camHitVec(canFree, ()))
-  entries.camWrite(canFree, (), allocatedField, false.B)
+    deqNotBlock || needFlush
+  }, ())
+  freeMaskVec := VecInit(canFree.zip(allocated.asBools).map { case (matched, isAllocated) =>
+    matched && isAllocated
+  })
 
   // if need replay revoke entry
   val lastCanAccept = GatedRegNext(acceptedVec)
@@ -220,12 +220,18 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
     val revokeValid = revoke && lastCanAccept(w)
     val revokeIndex = lastAllocIndex(w)
 
-    when (entries.read(revokeIndex).allocated && revokeValid) {
-      entries.writeField(revokeIndex, allocatedField, false.B)
+    when (allocated(revokeIndex) && revokeValid) {
       freeMaskVec(revokeIndex) := true.B
     }
   }
 
+  // Membership is a set bitmap; reclaim/revoke has priority over enqueue.
+  val allocationMask = VecInit((0 until LoadQueueRARSize).map { slot =>
+    acceptedVec.zip(enqIndexVec).map { case (accepted, index) =>
+      accepted && index === slot.U
+    }.reduce(_ || _)
+  }).asUInt
+  allocation.write(0.U, (allocated | allocationMask) & ~freeMaskVec.asUInt)
   freeList.io.free := freeMaskVec.asUInt
 
   // LoadQueueRAR Query
@@ -240,10 +246,11 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
 
     query.resp.valid := RegNext(query.req.valid)
     // Generate real violation mask
-    val youngerAllocated = entries.camHitVec((entry: LoadQueueRAREntry, robIdx: RobPtr) => {
-      entry.allocated && isAfter(entry.robIdx, robIdx)
+    val younger = entries.camHitVec((entry: LoadQueueRARKeys, robIdx: RobPtr) => {
+      isAfter(entry.robIdx, robIdx)
     }, query.req.bits.uop.robIdx)
-    val matchMaskReg = VecInit(youngerAllocated.zip(paddrModule.io.releaseViolationMmask(w)).zip(released).map {
+    val youngerAllocated = VecInit(younger).asUInt & allocated
+    val matchMaskReg = VecInit(youngerAllocated.asBools.zip(paddrModule.io.releaseViolationMmask(w)).zip(released).map {
       case ((younger, addrMatch), isReleased) => younger && (io.csrCtrl.tso_enable || addrMatch) && isReleased
     })
     val matchMask = RegEnable(matchMaskReg, query.req.valid)
@@ -262,8 +269,7 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   }
 
   // Preserve the original cycle and priority of physical-slot release updates.
-  val releaseAllocated = entries.camHitVec((entry: LoadQueueRAREntry, _: Unit) => entry.allocated, ())
-  val releasePending = RegNext(VecInit(paddrModule.io.releaseMmask.last.zip(releaseAllocated).map {
+  val releasePending = RegNext(VecInit(paddrModule.io.releaseMmask.last.zip(allocated.asBools).map {
     case (addrMatch, isAllocated) => addrMatch && isAllocated && release1Cycle.valid
   }))
   released.zip(releasePending).foreach { case (isReleased, pending) =>
