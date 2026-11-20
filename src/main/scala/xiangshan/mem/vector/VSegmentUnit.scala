@@ -668,8 +668,9 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   val shiftData    = (io.rdcache.resp.bits.data_delayed >> (latchVaddr(3, 0) << 3)).asUInt(63, 0)
   val mergemisalignData = Mux(notCross16ByteReg, shiftData, combinedData)
   val pickData  = rdataVecHelper(alignedType(1,0), Mux(isMisalignReg, mergemisalignData, cacheData))
+  private val splitEntry = storage.read(splitPtr.value)
   val mergedData = mergeDataWithElemIdx(
-    oldData = storage.read(splitPtr.value).data,
+    oldData = splitEntry.data,
     newData = Seq(pickData),
     alignedType = alignedType(1,0),
     elemIdx = Seq(elemIdxInVd),
@@ -684,7 +685,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
    * split data for store
    * */
   val splitData = genVSData(
-    data = storage.read(splitPtr.value).data,
+    data = splitEntry.data,
     elemIdx = elemIdxInVd,
     alignedType = alignedType
   )
@@ -779,8 +780,10 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
     Option(s"VSegmentUnitPipelineConnect")
   )
 
+  private val deqEntry = storage.read(deqPtr.value)
+
   io.vecDifftestInfo.valid         := io.sbuffer.valid
-  io.vecDifftestInfo.bits.uop      := storage.read(deqPtr.value).uop
+  io.vecDifftestInfo.bits.uop      := deqEntry.uop
   io.vecDifftestInfo.bits.start    := 0.U // only use in no-segment unit-stride
   io.vecDifftestInfo.bits.offset   := 0.U
 
@@ -897,7 +900,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   /*************************************************************************
    *                            dequeue logic
    *************************************************************************/
-  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), storage.read(deqPtr.value).uop.vpu.vuopIdx)
+  val vdIdxInField = GenUopIdxInField(Mux(isIndexed(instType), issueLmul, issueEmul), deqEntry.uop.vpu.vuopIdx)
   /*select mask of vd, maybe remove in feature*/
   val realEw        = Mux(isIndexed(issueInstType), issueSew(1, 0), issueEew(1, 0))
   val maskDataVec: Vec[UInt] = VecDataToMaskDataVec(instMicroOp.mask, realEw)
@@ -917,17 +920,17 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
     writebackOut.mask.get               := Fill(VLEN, 1.U)
     writebackOut.uop.vpu.vmask          := Fill(VLEN, 1.U)
   }.otherwise{
-    writebackOut.uop                    := storage.read(deqPtr.value).uop
+    writebackOut.uop                    := deqEntry.uop
     writebackOut.uop.vpu                := instMicroOp.uop.vpu
     writebackOut.uop.trigger            := instMicroOp.uop.trigger
     writebackOut.uop.exceptionVec       := instMicroOp.uop.exceptionVec
     writebackOut.mask.get               := instMicroOp.mask
-    writebackOut.data                   := storage.read(deqPtr.value).data
+    writebackOut.data                   := deqEntry.data
     writebackOut.vdIdx.get              := vdIdxInField
     writebackOut.uop.vpu.vl             := instMicroOp.vl
     writebackOut.uop.vpu.vstart         := Mux(instMicroOp.uop.exceptionVec.asUInt.orR || TriggerAction.isDmode(instMicroOp.uop.trigger), instMicroOp.exceptionVstart, instMicroOp.vstart)
     writebackOut.uop.vpu.vmask          := maskUsed
-    writebackOut.uop.vpu.vuopIdx        := storage.read(deqPtr.value).uop.vpu.vuopIdx
+    writebackOut.uop.vpu.vuopIdx        := deqEntry.uop.vpu.vuopIdx
     writebackOut.debug                  := DontCare
     writebackOut.vdIdxInField.get       := vdIdxInField
     writebackOut.uop.robIdx             := instMicroOp.uop.robIdx
@@ -947,8 +950,8 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   feedbackOut.sourceType              := DontCare
   feedbackOut.flushState              := DontCare
   feedbackOut.dataInvalidSqIdx        := DontCare
-  feedbackOut.sqIdx                   := storage.read(deqPtr.value).uop.sqIdx
-  feedbackOut.lqIdx                   := storage.read(deqPtr.value).uop.lqIdx
+  feedbackOut.sqIdx                   := deqEntry.uop.sqIdx
+  feedbackOut.lqIdx                   := deqEntry.uop.lqIdx
 
   io.feedback.valid                   := RegNext(feedbackValid)
   io.feedback.bits                    := RegEnable(feedbackOut, feedbackValid)
@@ -958,7 +961,7 @@ class VSegmentUnit (implicit p: Parameters) extends VLSUModule
   // exception
   io.exceptionInfo                    := DontCare
   io.exceptionInfo.bits.robidx        := instMicroOp.uop.robIdx
-  io.exceptionInfo.bits.uopidx        := storage.read(deqPtr.value).uop.vpu.vuopIdx
+  io.exceptionInfo.bits.uopidx        := deqEntry.uop.vpu.vuopIdx
   io.exceptionInfo.bits.vstart        := instMicroOp.exceptionVstart
   io.exceptionInfo.bits.vaddr         := instMicroOp.exceptionVaddr
   io.exceptionInfo.bits.gpaddr        := instMicroOp.exceptionGpaddr
