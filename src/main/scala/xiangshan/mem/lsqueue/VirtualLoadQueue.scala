@@ -93,19 +93,6 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   private val debugMmioField = FieldOf(new VirtualLoadQueueEntry)(_.debug_mmio)
   private val debugPaddrField = FieldOf(new VirtualLoadQueueEntry)(_.debug_paddr)
 
-  // Share the current-state flags across retirement, performance, and debug checks.
-  val entryStatus = VecInit(entries.foreach { entry =>
-    val status = Wire(new Bundle {
-      val allocated = Bool()
-      val committed = Bool()
-      val isvec = Bool()
-    })
-    status.allocated := entry.allocated
-    status.committed := entry.committed
-    status.isvec := entry.isvec
-    status
-  })
-
   //  maintain pointers
   val enqPtrExt = RegInit(VecInit((0 until io.enq.req.length).map(_.U.asTypeOf(new LqPtr))))
   val enqPtr = enqPtrExt(0).value
@@ -164,10 +151,10 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   val DeqPtrMoveStride = CommitWidth
   require(DeqPtrMoveStride == CommitWidth, "DeqPtrMoveStride must be equal to CommitWidth!")
   val deqLookupVec = VecInit((0 until DeqPtrMoveStride).map(deqPtr + _.U))
-  val deqLookup = VecInit(deqLookupVec.map(ptr => {
-    val status = entryStatus(ptr.value)
-    status.allocated && status.committed && ptr =/= enqPtrExt(0)
-  }))
+  val deqLookupEntries = deqLookupVec.map(ptr => entries.read(ptr.value))
+  val deqLookup = VecInit(deqLookupVec.zip(deqLookupEntries).map { case (ptr, entry) =>
+    entry.allocated && entry.committed && ptr =/= enqPtrExt(0)
+  })
   val deqInSameRedirectCycle = VecInit(deqLookupVec.map(ptr => needCancel(ptr.value)))
   // make chisel happy
   val deqCountMask = Wire(UInt(DeqPtrMoveStride.W))
@@ -187,7 +174,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   io.ldWbPtr := deqPtr
   io.lqEmpty := RegNext(validCount === 0.U)
 
-  val deqEntry = entries.read(deqPtr.value)
+  val deqEntry = deqLookupEntries.head
   io.lqDeqRobIdx := deqEntry.robIdx
   io.lqDeqUopIdx := deqEntry.uopIdx
 
@@ -244,7 +231,7 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
     when (commitCount > i.U) {
       entries.writeField((deqPtr+i.U).value, allocatedField, false.B)
     }
-    XSError(commitCount > i.U && !entryStatus((deqPtr+i.U).value).allocated, s"why commit invalid entry $i?\n")
+    XSError(commitCount > i.U && !deqLookupEntries(i).allocated, s"why commit invalid entry $i?\n")
   })
 
   // vector commit or replay
@@ -306,8 +293,6 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
 
   //  perf counter
   QueuePerf(VirtualLoadQueueSize, validCount, !allowEnqueue)
-  val vecValidVec = WireInit(VecInit(entryStatus.map(status => status.allocated && status.isvec)))
-  QueuePerf(VirtualLoadQueueSize, PopCount(vecValidVec), !allowEnqueue)
   io.lqFull := !allowEnqueue
 
   val perfEvents: Seq[(String, UInt)] = Seq()
@@ -321,12 +306,14 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
     XSDebug(false, !flag, " ") // otherwise
   }
 
-  for (i <- 0 until VirtualLoadQueueSize) {
-    val status = entryStatus(i)
-    PrintFlag(status.allocated, "a")
-    PrintFlag(status.allocated && status.committed, "c")
-    PrintFlag(vecValidVec(i), "v")
+  val vecValidVec = WireInit(VecInit(entries.foreach { entry =>
+    val vecValid = entry.allocated && entry.isvec
+    PrintFlag(entry.allocated, "a")
+    PrintFlag(entry.allocated && entry.committed, "c")
+    PrintFlag(vecValid, "v")
     XSDebug(false, true.B, "\n")
-  }
+    vecValid
+  }))
+  QueuePerf(VirtualLoadQueueSize, PopCount(vecValidVec), !allowEnqueue)
   // end
 }
