@@ -189,28 +189,26 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
   val enqUpBound  = io.enq.req.map(x => x.bits.lqIdx + x.bits.numLsElem)
   val enqCrossLoop = enqLowBound.zip(enqUpBound).map{case (low, up) => low.flag =/= up.flag}
 
-  for(i <- 0 until VirtualLoadQueueSize) {
-    val entryCanEnqSeq = (0 until io.enq.req.length).map { j =>
-      val entryHitBound = Mux(
+  // Later writes take priority, so the lowest enqueue lane writes last.
+  for (j <- io.enq.req.indices.reverse) {
+    val enqMask = (0 until VirtualLoadQueueSize).map { i =>
+      Mux(
         enqCrossLoop(j),
         enqLowBound(j).value <= i.U || i.U < enqUpBound(j).value,
         enqLowBound(j).value <= i.U && i.U < enqUpBound(j).value
       )
-      canEnqueue(j) && !enqCancel(j) && entryHitBound
     }
-    val entryCanEnq = entryCanEnqSeq.reduce(_ || _)
-    val selectBits = ParallelPriorityMux(entryCanEnqSeq, io.enq.req.map(_.bits))
-    when (entryCanEnq) {
+    when (canEnqueue(j) && !enqCancel(j)) {
       val entry = Wire(new VirtualLoadQueueEntry)
       entry.allocated := true.B
-      entry.robIdx := selectBits.robIdx
-      entry.uopIdx := selectBits.uopIdx
-      entry.isvec := FuType.isVLoad(selectBits.fuType)
+      entry.robIdx := io.enq.req(j).bits.robIdx
+      entry.uopIdx := io.enq.req(j).bits.uopIdx
+      entry.isvec := FuType.isVLoad(io.enq.req(j).bits.fuType)
       entry.committed := false.B
 
       entry.debug_mmio := false.B
       entry.debug_paddr := 0.U
-      entries.write(i.U, entry)
+      entries.writeMasked(enqMask, entry)
     }
   }
 
