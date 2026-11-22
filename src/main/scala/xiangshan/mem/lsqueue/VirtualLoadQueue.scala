@@ -185,19 +185,12 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
    * Dynamic enq based on numLsElem number
    */
   io.enq.canAccept := allowEnqueue
-  val enqLowBound = io.enq.req.map(_.bits.lqIdx)
-  val enqUpBound  = io.enq.req.map(x => x.bits.lqIdx + x.bits.numLsElem)
-  val enqCrossLoop = enqLowBound.zip(enqUpBound).map{case (low, up) => low.flag =/= up.flag}
+  // Cover every encodable flow count that fits in the queue.
+  val maxEnqFlow = (BigInt(VirtualLoadQueueSize) min
+    ((BigInt(1) << io.enq.req.head.bits.numLsElem.getWidth) - 1)).toInt
 
   // Later writes take priority, so the lowest enqueue lane writes last.
   for (j <- io.enq.req.indices.reverse) {
-    val enqMask = (0 until VirtualLoadQueueSize).map { i =>
-      Mux(
-        enqCrossLoop(j),
-        enqLowBound(j).value <= i.U || i.U < enqUpBound(j).value,
-        enqLowBound(j).value <= i.U && i.U < enqUpBound(j).value
-      )
-    }
     when (canEnqueue(j) && !enqCancel(j)) {
       val entry = Wire(new VirtualLoadQueueEntry)
       entry.allocated := true.B
@@ -208,7 +201,12 @@ class VirtualLoadQueue(implicit p: Parameters) extends XSModule
 
       entry.debug_mmio := false.B
       entry.debug_paddr := 0.U
-      entries.writeMasked(enqMask, entry)
+      for (flow <- 0 until maxEnqFlow) {
+        when (flow.U < io.enq.req(j).bits.numLsElem) {
+          val index = (io.enq.req(j).bits.lqIdx + flow.U).value
+          entries.write(index, entry)
+        }
+      }
     }
   }
 

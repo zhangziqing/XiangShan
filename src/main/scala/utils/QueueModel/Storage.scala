@@ -11,17 +11,6 @@ abstract class Storage[T <: Data](val entries: Int) {
   def read(index: Int): T
   def read(index: UInt): T
   def write(index: UInt, content: T): Unit
-  /** Writes one complete entry value to every enabled physical slot.
-    * The mask must contain exactly `entries` bits in physical index order.
-    * Reads observe current state; later writes retain per-field priority.
-    * Backends may override the indexed-write fallback with a bulk implementation.
-    */
-  def writeMasked(mask: Seq[Bool], content: T): Unit = {
-    require(mask.length == entries, "write mask must describe every storage entry")
-    for (slot <- 0 until entries) {
-      when(mask(slot)) { write(slot.U, content) }
-    }
-  }
   /** Writes one validated static member path of the addressed entry. */
   def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
 
@@ -115,13 +104,6 @@ class RegStorage[T <: Data](
     for (slot <- 0 until entries) {
       when(index === slot.U) { contents(slot) := content }
     }
-
-  override final def writeMasked(mask: Seq[Bool], content: T): Unit = {
-    require(mask.length == entries, "write mask must describe every storage entry")
-    for (slot <- 0 until entries) {
-      when(mask(slot)) { contents(slot) := content }
-    }
-  }
 
   override final def writeField[D <: Data](
     index: UInt,
