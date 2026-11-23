@@ -15,9 +15,12 @@ abstract class Storage[T <: Data](val entries: Int) {
   def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
 
   /** Returns one current-state match bit per physical slot, without a hit bound.
-    * Validity and query enables belong in the predicate; writes are not forwarded.
+    * A disabled query returns zeros; writes are not forwarded.
     */
-  def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool]
+  def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool = true.B): Seq[Bool]
+
+  /** True when enabled and any current entry matches; disabled queries return false. */
+  def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool = true.B): Bool
 
   /** Returns `entries` ascending matching indices, padded with the invalid index
     * `entries`. Each unsigned index has width `max(1, log2Ceil(entries + 1))`.
@@ -114,8 +117,11 @@ class RegStorage[T <: Data](
       when(index === slot.U) { field.select(contents(slot)) := content }
     }
 
-  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
-    contents.toSeq.map(entry => f(entry.readOnly, arg).readOnly)
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool): Seq[Bool] =
+    contents.toSeq.map(entry => (enabled && f(entry.readOnly, arg)).readOnly)
+
+  override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
+    (enabled && camHitVec(f, arg).reduce(_ || _)).readOnly
 
   private def rankedHitMasks(hits: Seq[Bool], count: Int): Seq[Seq[Bool]] = {
     if (count == 1) Seq(hits)

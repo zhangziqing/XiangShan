@@ -195,8 +195,10 @@ class ModelStorage[T <: Data](
     anchorResults(results, ids, op)
     results
   }
-  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
-    camQuery(f, arg, HitVector, source).map(_.asBool.readOnly)
+  override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
+    (enabled && camHitVec(f, arg).reduce(_ || _)).readOnly
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool): Seq[Bool] =
+    camQuery(f, arg, HitVector, source).map(value => (enabled && value.asBool).readOnly)
   override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] =
     camQuery(f, arg, HitIndices, source).map(_.readOnly)
   override final def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int): Seq[(T, Bool)] =
