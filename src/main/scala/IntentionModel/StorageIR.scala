@@ -15,7 +15,6 @@ import utils.QueueModel.FieldOf
 final case class StorageId(value: Long)
 final case class OpId(value: Int)
 final case class ValueId(value: Int)
-final case class ExprId(value: Int)
 final case class SourceLoc(file: String, line: Int, column: Option[Int] = None)
 
 sealed trait StorageType
@@ -53,31 +52,6 @@ sealed trait InitialState
 case object UnspecifiedInitialState extends InitialState
 final case class ConstantInitialState(bits: Vector[BigInt]) extends InitialState
 final case class MaskedInitialState(bits: Vector[BigInt], masks: Vector[BigInt]) extends InitialState
-
-sealed trait UnaryOp
-case object BitNot extends UnaryOp
-case object Negate extends UnaryOp
-sealed trait BinaryOp
-case object BitAnd extends BinaryOp
-case object BitOr extends BinaryOp
-case object BitXor extends BinaryOp
-case object Add extends BinaryOp
-case object Subtract extends BinaryOp
-case object Equal extends BinaryOp
-case object LessThan extends BinaryOp
-
-/** Reserved callback graph. Arithmetic wraps to resultType's explicit width. */
-sealed trait ExprNode { def id: ExprId; def resultType: StorageType }
-final case class FieldRef(id: ExprId, path: Vector[FieldStep], resultType: StorageType) extends ExprNode
-final case class ParamRef(id: ExprId, value: ValueId, resultType: StorageType) extends ExprNode
-final case class Literal(id: ExprId, bits: BigInt, resultType: StorageType) extends ExprNode
-final case class Unary(id: ExprId, op: UnaryOp, arg: ExprId, resultType: StorageType) extends ExprNode
-final case class Binary(
-  id: ExprId, op: BinaryOp, lhs: ExprId, rhs: ExprId, resultType: StorageType
-) extends ExprNode
-final case class Mux(
-  id: ExprId, cond: ExprId, t: ExprId, f: ExprId, resultType: StorageType
-) extends ExprNode
 
 sealed trait StorageOp { def id: OpId; def ordinal: Int; def source: SourceLoc }
 final case class ReadOp(
@@ -128,10 +102,13 @@ final case class StorageIR(
   reset: ResetSpec,
   initial: InitialState,
   values: Vector[StorageValue],
-  expressions: Vector[ExprNode],
   operations: Vector[StorageOp],
   functions: Vector[StorageFunctionDef] = Vector.empty
 )
+
+object StorageIR {
+  val CurrentVersion = 4
+}
 
 object StorageLayout {
   val Packing = "chisel-asUInt-lsb-first-v1"
@@ -214,7 +191,6 @@ object StorageIRCodec {
   implicit val storageIdRW: ReadWriter[StorageId] = macroRW
   implicit val opIdRW: ReadWriter[OpId] = macroRW
   implicit val valueIdRW: ReadWriter[ValueId] = macroRW
-  implicit val exprIdRW: ReadWriter[ExprId] = macroRW
   implicit val sourceRW: ReadWriter[SourceLoc] = macroRW
   implicit val uintRW: ReadWriter[UIntType] = macroRW
   implicit val sintRW: ReadWriter[SIntType] = macroRW
@@ -238,25 +214,6 @@ object StorageIRCodec {
   implicit val initialBitsRW: ReadWriter[ConstantInitialState] = macroRW
   implicit val maskedInitialRW: ReadWriter[MaskedInitialState] = macroRW
   implicit val initialRW: ReadWriter[InitialState] = ReadWriter.merge(unspecifiedRW, initialBitsRW, maskedInitialRW)
-  implicit val bitNotRW: ReadWriter[BitNot.type] = macroRW
-  implicit val negateRW: ReadWriter[Negate.type] = macroRW
-  implicit val unaryOpRW: ReadWriter[UnaryOp] = ReadWriter.merge(bitNotRW, negateRW)
-  implicit val andRW: ReadWriter[BitAnd.type] = macroRW
-  implicit val orRW: ReadWriter[BitOr.type] = macroRW
-  implicit val xorRW: ReadWriter[BitXor.type] = macroRW
-  implicit val addRW: ReadWriter[Add.type] = macroRW
-  implicit val subRW: ReadWriter[Subtract.type] = macroRW
-  implicit val eqRW: ReadWriter[Equal.type] = macroRW
-  implicit val ltRW: ReadWriter[LessThan.type] = macroRW
-  implicit val binaryOpRW: ReadWriter[BinaryOp] = ReadWriter.merge(andRW, orRW, xorRW, addRW, subRW, eqRW, ltRW)
-  implicit val fieldRefRW: ReadWriter[FieldRef] = macroRW
-  implicit val paramRW: ReadWriter[ParamRef] = macroRW
-  implicit val literalRW: ReadWriter[Literal] = macroRW
-  implicit val unaryRW: ReadWriter[Unary] = macroRW
-  implicit val binaryRW: ReadWriter[Binary] = macroRW
-  implicit val muxRW: ReadWriter[Mux] = macroRW
-  implicit val exprRW: ReadWriter[ExprNode] =
-    ReadWriter.merge(fieldRefRW, paramRW, literalRW, unaryRW, binaryRW, muxRW)
   implicit val anyMatchRW: ReadWriter[AnyMatch.type] = macroRW
   implicit val hitVecRW: ReadWriter[HitVector.type] = macroRW
   implicit val hitIdxRW: ReadWriter[HitIndices.type] = macroRW
@@ -278,7 +235,10 @@ object StorageIRCodec {
 
   def encode(ir: StorageIR): String = { StorageIRValidation.validate(ir); write(ir, indent = 2) }
   def decode(json: String): StorageIR = {
-    val ir = read[StorageIR](json)
+    val data = ujson.read(json)
+    require(data.obj.get("expressions").forall(_.arr.isEmpty),
+      "callback expression lowering is not implemented")
+    val ir = read[StorageIR](data)
     StorageIRValidation.validate(ir)
     ir
   }
@@ -286,7 +246,7 @@ object StorageIRCodec {
 
 object StorageIRValidation {
   def validate(ir: StorageIR): Unit = {
-    require(Set(1, 2, 3)(ir.schemaVersion), "unsupported storage IR schema")
+    require(ir.schemaVersion >= 1 && ir.schemaVersion <= StorageIR.CurrentVersion, "unsupported storage IR schema")
     require(ir.schemaVersion >= 2 || ir.functions.isEmpty, "schema 1 cannot contain functions")
     require(ir.id.value >= 0 && ir.entries > 0, "invalid storage identity or capacity")
     require(ir.entry == StorageLayout(ir.entry.shape), "inconsistent entry layout or packing")
@@ -324,28 +284,6 @@ object StorageIRValidation {
         case SignalValue(s) => signal(s, v.tpe)
         case ReadResultValue(_, s) => signal(s, v.tpe)
       }
-    }
-    require(ir.expressions.map(_.id).distinct.size == ir.expressions.size, "duplicate expression ID")
-    val expressions = scala.collection.mutable.Map.empty[ExprId, StorageType]
-    def expr(id: ExprId): StorageType = expressions.getOrElse(id,
-      throw new IllegalArgumentException(s"expression dependency missing or not topological: $id"))
-    ir.expressions.foreach { e =>
-      require(e.id.value >= 0, "negative expression ID")
-      StorageLayout.width(e.resultType)
-      e match {
-        case FieldRef(_, path, result) => require(StorageLayout.field(ir.entry, path)._1 == result)
-        case ParamRef(_, value, result) => require(tpe(value) == result)
-        case Literal(_, b, result) => bits(b, result)
-        case Unary(_, _, arg, result) =>
-          require(expr(arg) == result && (result.isInstanceOf[UIntType] || result.isInstanceOf[SIntType]))
-        case Binary(_, op, lhs, rhs, result) =>
-          require(expr(lhs) == expr(rhs), "binary operand type mismatch")
-          require(expr(lhs).isInstanceOf[UIntType] || expr(lhs).isInstanceOf[SIntType])
-          require(result == (op match { case Equal | LessThan => UIntType(1); case _ => expr(lhs) }))
-        case Mux(_, cond, t, f, result) =>
-          require(expr(cond) == UIntType(1) && expr(t) == result && expr(f) == result)
-      }
-      expressions(e.id) = e.resultType
     }
     require(ir.functions.map(_.id).distinct.size == ir.functions.size, "duplicate function ID")
     ir.functions.foreach { f =>
@@ -431,7 +369,6 @@ object StorageIRValidation {
     validate(ir)
     require(ir.entry.totalWidth <= 64, "DPI entry width must be at most 64 bits")
     require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
-    require(ir.expressions.isEmpty, "callback expression lowering is not implemented")
     ir.functions.foreach(StorageFunctionCpp.function)
     val types = ir.values.map(v => v.id -> v.tpe).toMap
     ir.operations.foreach {
@@ -606,8 +543,8 @@ final class StorageIRBuilder(
     val byId = definitions.map(f => f.id -> f).toMap
     val functions = functionIds.map(fid => byId.getOrElse(fid,
       throw new IllegalArgumentException(s"function $fid has not been lowered"))).toVector
-    val ir = StorageIR(3, id, Some(instancePath), entries, layout, clock, reset, initial,
-      values, Vector.empty, ops.toVector, functions)
+    val ir = StorageIR(StorageIR.CurrentVersion, id, Some(instancePath), entries, layout, clock, reset, initial,
+      values, ops.toVector, functions)
     StorageIRValidation.requireDPI(ir)
     sealedIR = Some(ir)
     captured.clear()

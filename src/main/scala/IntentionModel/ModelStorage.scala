@@ -585,7 +585,7 @@ object StorageDPIEmitter {
          |  $partialReset
          |}""".stripMargin
     }.mkString("\n")
-    s"""// Generated from storage IR schema 1/2/3. Do not edit.
+    s"""// Generated from storage IR. Do not edit.
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
