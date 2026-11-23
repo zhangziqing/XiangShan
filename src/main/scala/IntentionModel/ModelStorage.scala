@@ -89,11 +89,7 @@ class ModelStorage[T <: Data](
         batchReads += capturedIndex -> result
         result
     }
-    val (op, result) = builder.read(capturedIndex, value, location)
-    annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = StorageReadResultAnnotation(value.toAbsoluteTarget,
-        builder.id.value, op.value, result.value)
-    })
+    builder.read(capturedIndex, value, location)
     value.asTypeOf(gen).readOnly
   }
   override final def read(index: Int): T = {
@@ -164,11 +160,6 @@ class ModelStorage[T <: Data](
     params.zipWithIndex.foreach { case (value, i) => connections += bridge.io.parameter(i) -> builder.data(value) }
     types.indices.map(bridge.io.value).toVector
   }
-  private def anchorResults(results: Vector[UInt], ids: Vector[ValueId], op: OpId): Unit =
-    results.zip(ids).foreach { case (data, id) => annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = StorageReadResultAnnotation(data.toAbsoluteTarget, builder.id.value, op.value, id.value)
-    }) }
-
   override final def update(f: T => T): Unit = {
     context()
     val location = source
@@ -184,10 +175,8 @@ class ModelStorage[T <: Data](
       (entry: T, _: Option[Data]) => f(entry), None, location)
     val tpe = StorageLayout.fromData(prototype).shape
     val guard = capture(when.cond.asUInt, 1, UIntType(1))
-    val op = builder.nextOp
     val results = queryFunction(fid, guard, Vector.empty, Vector.fill(entries)(tpe))
-    val ids = builder.foreach(fid, results.map(x => x: Data), tpe, location)
-    anchorResults(results, ids, op)
+    builder.foreach(fid, results.map(x => x: Data), tpe, location)
     results.map(_.asTypeOf(prototype).readOnly)
   }
   private def camQuery[P](
@@ -204,12 +193,10 @@ class ModelStorage[T <: Data](
         Vector.fill(n)(Vector(layout.shape, UIntType(1))).flatten
     }
     val guard = capture(when.cond.asUInt, 1, UIntType(1))
-    val op = builder.nextOp
     val active = enabled.map(e => capture(e.asUInt, 1, UIntType(1)))
     val results = queryFunction(fid, guard, params, types, active, query.isInstanceOf[ReadMatches])
-    val ids = builder.camQuery(query, fid, guard, params,
+    builder.camQuery(query, fid, guard, params,
       results.zip(types).map { case (d, t) => (d: Data) -> t }, location, active)
-    anchorResults(results, ids, op)
     results
   }
   override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
@@ -281,16 +268,10 @@ class ModelStorage[T <: Data](
             synchronous = true, activeHigh = true),
           data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)), session.functions)
         session.record(ir)
-        ir
       })
     })
   })
 }
-
-/** Compatibility alias for explicitly constructed synchronous software models.
-  * Backend-independent modules use IntentionCallback and the Storage declaration.
-  */
-trait StorageModelOwner extends RequireSyncReset with IntentionCallback
 
 sealed trait StorageReadBridgeMode
 object StorageReadBridgeMode {
@@ -728,26 +709,5 @@ object StorageModelStage {
     val result = Storage.withBackend(implementation)(generate(session))
     if (option.backend != StorageBackend.RTL) artifacts(session.models, build, Paths.get(option.runtimeHeader))
     result
-  }
-
-  /** Compatibility entry point for explicitly instantiated ModelStorage. */
-  def emit(generator: StorageIRSession => RawModule, buildDirectory: Path): Vector[StorageIR] =
-    emit(generator, buildDirectory, defaultRuntime)
-
-  def emit(
-    generator: StorageIRSession => RawModule,
-    buildDirectory: Path,
-    runtimeHeader: Path
-  ): Vector[StorageIR] = {
-    require(Files.isRegularFile(runtimeHeader), s"Storage runtime header is missing: $runtimeHeader")
-    val build = buildDirectory.toAbsolutePath.normalize()
-    val session = new StorageIRSession
-    (new top.XiangShanStage).execute(
-      Array("--target", "systemverilog", "--target-dir", build.resolve(".storage-stage").toString),
-      Seq(ChiselGeneratorAnnotation(() => generator(session)), FirtoolOption("--split-verilog"),
-        FirtoolOption(s"-o=${build.resolve("rtl")}")))
-    val models = session.models
-    artifacts(models, build, runtimeHeader)
-    models
   }
 }

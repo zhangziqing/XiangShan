@@ -4,7 +4,7 @@ package IntentionModel
 import chisel3._
 import firrtl.AnnotationSeq
 import firrtl.annotations.TargetToken
-import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget, SingleTargetAnnotation}
+import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget}
 import firrtl.options.Unserializable
 import firrtl.options.{Dependency, Phase}
 import firrtl.stage.FirrtlCircuitAnnotation
@@ -380,12 +380,6 @@ object StorageIRValidation {
   }
 }
 
-final case class StorageReadResultAnnotation(
-  target: ReferenceTarget, storageId: Long, opId: Int, resultId: Int
-) extends SingleTargetAnnotation[ReferenceTarget] with Unserializable {
-  def duplicate(n: ReferenceTarget): StorageReadResultAnnotation = copy(target = n)
-}
-
 /** Stage consumes these exact capture anchors before calling firtool. */
 private[IntentionModel] final case class StorageWiringAnnotation(
   module: String,
@@ -395,12 +389,8 @@ private[IntentionModel] final case class StorageWiringAnnotation(
   connections: Vector[(ReferenceTarget, ReferenceTarget)]
 ) extends NoTargetAnnotation with Unserializable
 
-private[IntentionModel] final case class StoragePendingIRAnnotation(finish: () => StorageIR)
+private[IntentionModel] final case class StoragePendingIRAnnotation(finish: () => Unit)
   extends NoTargetAnnotation with Unserializable
-
-final case class StorageIRAnnotation(json: String) extends NoTargetAnnotation with Unserializable {
-  def ir: StorageIR = StorageIRCodec.decode(json)
-}
 
 /** Explicit per-elaboration ownership: IDs restart in a new session. */
 final class StorageIRSession {
@@ -431,7 +421,7 @@ final class StorageIRSession {
 }
 
 private[IntentionModel] final case class StorageWritePort(
-  id: OpId, guard: ValueId, index: ValueId, value: ValueId, offset: Int, width: Int
+  guard: ValueId, index: ValueId, value: ValueId
 )
 
 /** Data identities live only here and are released after Stage sealing. */
@@ -441,7 +431,6 @@ final class StorageIRBuilder(
   private final case class Captured(id: ValueId, data: Data, tpe: StorageType, read: Option[OpId])
   private val captured = ArrayBuffer.empty[Captured]
   private val ops = ArrayBuffer.empty[StorageOp]
-  private val ports = ArrayBuffer.empty[StorageWritePort]
   private val functionIds = ArrayBuffer.empty[FunctionId]
 
   private[IntentionModel] def function[T <: Data, R <: Data](
@@ -459,7 +448,6 @@ final class StorageIRBuilder(
   private var closed = false
   private var sealedIR: Option[StorageIR] = None
   private def open(): Unit = require(!closed && sealedIR.isEmpty, "storage capture is closed")
-  def isSealed: Boolean = sealedIR.nonEmpty
   private[IntentionModel] def nextOp: OpId = { open(); OpId(ops.size) }
   private[IntentionModel] def capture(data: Data, tpe: StorageType, read: Option[OpId] = None): ValueId = {
     open()
@@ -468,22 +456,19 @@ final class StorageIRBuilder(
     captured += Captured(value, data, tpe, read)
     value
   }
-  private[IntentionModel] def read(index: ValueId, data: Data, source: SourceLoc): (OpId, ValueId) = {
+  private[IntentionModel] def read(index: ValueId, data: Data, source: SourceLoc): Unit = {
     val op = nextOp
     val result = capture(data, layout.shape, Some(op))
     ops += ReadOp(op, ops.size, Operand(index), result, source)
-    (op, result)
   }
   private[IntentionModel] def write(
     guard: ValueId, index: ValueId, value: ValueId, path: Option[Vector[FieldStep]], source: SourceLoc
   ): Unit = {
     val op = nextOp
-    val (_, offset, width) = path.map(StorageLayout.field(layout, _)).getOrElse((layout.shape, 0, layout.totalWidth))
     ops += (path match {
       case Some(p) => WriteFieldOp(op, ops.size, Operand(guard), Operand(index), p, Operand(value), source)
       case None => WriteOp(op, ops.size, Operand(guard), Operand(index), Operand(value), source)
     })
-    ports += StorageWritePort(op, guard, index, value, offset, width)
   }
   private[IntentionModel] def writeMask(
     guard: ValueId, masks: Vector[ValueId], path: Vector[FieldStep], value: ValueId, source: SourceLoc
@@ -498,20 +483,18 @@ final class StorageIRBuilder(
   }
   private[IntentionModel] def foreach(
     function: FunctionId, results: Vector[Data], tpe: StorageType, source: SourceLoc
-  ): Vector[ValueId] = {
+  ): Unit = {
     val op = nextOp
     val ids = results.map(capture(_, tpe, Some(op)))
     ops += ForeachOp(op, ops.size, function, ids, source)
-    ids
   }
   private[IntentionModel] def camQuery(
     query: CamQuery, function: FunctionId, guard: ValueId, params: Vector[ValueId],
     results: Vector[(Data, StorageType)], source: SourceLoc, enabled: Option[ValueId] = None
-  ): Vector[ValueId] = {
+  ): Unit = {
     val op = nextOp
     val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
     ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)), enabled.map(Operand))
-    ids
   }
   private[IntentionModel] def camWrite(
     function: FunctionId, guard: ValueId, params: Vector[ValueId], path: Option[Vector[FieldStep]],
@@ -520,7 +503,10 @@ final class StorageIRBuilder(
     val op = nextOp
     ops += CamWriteOp(op, ops.size, Operand(guard), function, params.map(Operand), path, Operand(value), source)
   }
-  private[IntentionModel] def writes: Vector[StorageWritePort] = ports.toVector
+  private[IntentionModel] def writes: Vector[StorageWritePort] = ops.collect {
+    case WriteOp(_, _, guard, index, value, _) => StorageWritePort(guard.value, index.value, value.value)
+    case WriteFieldOp(_, _, guard, index, _, value, _) => StorageWritePort(guard.value, index.value, value.value)
+  }.toVector
   private[IntentionModel] def data(id: ValueId): Data = captured(id.value).data
   private[IntentionModel] def closeCapture(): Unit = { open(); closed = true }
 
@@ -549,7 +535,6 @@ final class StorageIRBuilder(
     sealedIR = Some(ir)
     captured.clear()
     ops.clear()
-    ports.clear()
     functionIds.clear()
     ir
   }
