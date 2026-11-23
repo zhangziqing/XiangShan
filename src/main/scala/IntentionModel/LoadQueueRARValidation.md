@@ -46,6 +46,7 @@ The new generic mechanisms are:
 - Pure, combinational callbacks support `update`, `foreach` and the CAM APIs.
   Hardware context is passed as explicit typed parameters. External hardware
   references, stateful bodies and unsupported primitives fail generation.
+  `camRead` overflow checks use the caller's Chisel clock, reset and when scope.
   Entry, input parameter and callback output widths are at most 64 bits; the
   Bits runtime supports intermediates through 128 bits.
 - `camAny` returns a scalar reduction. Its branchless C++ reduction permits
@@ -92,11 +93,12 @@ No Scala tests/specs are included in the PR.
 
 | Executed check | Result |
 | --- | --- |
-| `mill -i xiangshan.compile` | PASS; final log `mill-compile-release.log` |
+| `mill -i -j 4 xiangshan.compile` | PASS; final log `mill-compile-camread.log` |
 | Final Storage RTL vs original RTL, two traces | PASS; 65,532 checked cycles per trace, before and after each edge |
 | Final CoSim vs original RTL, same two traces | PASS; same cycle checks, including invalid response hold |
 | UInt/SInt 1/8/63/64-bit and Bundle/Vec callback matrix | PASS; 9 models x 5,000 cycles in each indexed-read bridge mode |
-| All callback APIs and mixed write ordering | PASS; 50,000 cycles against independent RegStorage implementation |
+| All callback APIs and mixed write ordering | PASS; 50,000 cycles against independent RegStorage implementation, repeated after the clocked camRead assertion fix |
+| camRead overflow assertion timing | PASS in both backends; reset and guard suppression, combinational transients, old-state edge sampling, and expected rising-edge failure |
 | 65-entry, 64-bit entry boundary miter | PASS; 12,000 cycles, partial reset writes, disabled queries, masks crossing 63/64/65, invalid indices and old-state sampling |
 | Packed CAM masks | PASS; 1/7/8/9/63/64/65/72 entries, all 256 byte patterns, random masks and padding, ASan/UBSan |
 | Bits arithmetic/runtime reference checks | PASS; boost::multiprecision::cpp_int reference with ASan/UBSan, leak detection disabled for sandbox compatibility |
@@ -210,7 +212,14 @@ Current absolute artifact root:
 - `boundary-packed/check.log`, `callback-packed/check.log`,
   `matrix-final/check.log`, `matrix-read-final/check.log`,
   `negative-checks.log`, `legacy-codec-checks.log`: verification results and local verification sources.
-- `mill-compile-release.log`: successful full project compile. Duplicated Mill
+- `camread-model/check.log`, `camread-rtl/check.log`,
+  `camread-overflow-checks.json`: assertion timing regression and expected failures.
+- `rar-clocked-comparison.json`: after the assertion fix, all RAR C++/headers
+  remain byte-identical to the measured model; SV differs only in source-location
+  comments. `correctness-after-camread.json` records both repeated trace checks.
+- `mill-compile-camread.log`: successful full project compile after the final
+  assertion fix; the final generated Mill cache used temporary local disk to
+  avoid the account space limit. Duplicated Mill
   cache and obsolete intermediate object directories were removed after an
   account space limit interrupted setup; final binaries and raw logs remain.
 

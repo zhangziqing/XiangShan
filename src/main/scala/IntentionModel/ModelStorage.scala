@@ -151,11 +151,13 @@ class ModelStorage[T <: Data](
   }
   private def queryFunction(
     function: FunctionId, guard: ValueId, params: Vector[ValueId], types: Vector[StorageType],
-    enabled: Option[ValueId] = None
+    enabled: Option[ValueId] = None, checkOverflow: Boolean = false
   ): Vector[UInt] = {
     val bridge = Module(new StorageFunctionQueryBridge(builder.id, builder.nextOp, function,
-      params.map(builder.data(_).getWidth), types.map(StorageLayout.width)))
+      params.map(builder.data(_).getWidth), types.map(StorageLayout.width), checkOverflow))
     functionQueries += bridge
+    // Use the caller's clock, reset and when scope, just like RegStorage.camRead.
+    if (checkOverflow) chisel3.assert(!bridge.io.overflow, "camRead hit count exceeds maxHits")
     connections += bridge.io.enabled -> builder.data(guard)
     val active = enabled.getOrElse(capture(true.B.asUInt, 1, UIntType(1)))
     connections += bridge.io.active -> builder.data(active)
@@ -204,7 +206,7 @@ class ModelStorage[T <: Data](
     val guard = capture(when.cond.asUInt, 1, UIntType(1))
     val op = builder.nextOp
     val active = enabled.map(e => capture(e.asUInt, 1, UIntType(1)))
-    val results = queryFunction(fid, guard, params, types, active)
+    val results = queryFunction(fid, guard, params, types, active, query.isInstanceOf[ReadMatches])
     val ids = builder.camQuery(query, fid, guard, params,
       results.zip(types).map { case (d, t) => (d: Data) -> t }, location, active)
     anchorResults(results, ids, op)
