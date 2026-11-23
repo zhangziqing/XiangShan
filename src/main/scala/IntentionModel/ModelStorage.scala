@@ -367,8 +367,6 @@ object StorageDPIEmitter {
     models.foreach(StorageIRValidation.requireDPI)
     require(models.map(_.id).distinct.size == models.size, "duplicate storage ID in executable")
     val ordered = models.sortBy(_.id.value)
-    val functions = functionDefinitions(models)
-    val functionInclude = if (functions.isEmpty) "" else "#include \"storage_functions.hpp\""
     def u(bits: BigInt): String = s"UINT64_C(0x${bits.toString(16)})"
     val storageModels = ordered.map { ir =>
       val initial = ir.initial match {
@@ -428,7 +426,6 @@ object StorageDPIEmitter {
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
-       |$functionInclude
        |$storageModels
        |$readFunctions
        |$readBatches
@@ -436,17 +433,8 @@ object StorageDPIEmitter {
        |""".stripMargin
   }
 
-  def functionDefinitions(models: Vector[StorageIR]): Vector[StorageFunctionDef] = {
-    models.flatMap(_.functions).groupBy(_.id).toVector.sortBy(_._1.value).map { case (_, definitions) =>
-      require(definitions.distinct.size == 1, "conflicting global function ID")
-      definitions.head
-    }
-  }
-
   def emit(models: Vector[StorageIR], directory: Path): Unit = {
     val source = cpp(models)
-    val functions = functionDefinitions(models)
-    StorageFunctionArtifacts.emit(functions, directory)
     Files.createDirectories(directory)
     val stale = Files.newDirectoryStream(directory, "storage-*.json")
     try {
