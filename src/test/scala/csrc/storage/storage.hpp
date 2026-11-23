@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 namespace intention {
@@ -30,6 +31,97 @@ public:
   void reset(const State &initial) {
     for (std::size_t i = 0; i < Entries; ++i)
       state_[i] = static_cast<Entry>(initial[i] & mask(Width));
+  }
+  void resetMasked(const State &initial, const State &masks) {
+    for (std::size_t i = 0; i < Entries; ++i)
+      state_[i] = static_cast<Entry>((state_[i] & ~masks[i]) | (initial[i] & masks[i]));
+  }
+  template<class Function>
+  std::array<std::uint64_t, Entries> foreach(Function function) const {
+    std::array<std::uint64_t, Entries> result{};
+    for (std::size_t i = 0; i < Entries; ++i) result[i] = function(read(i));
+    return result;
+  }
+  template<class Function>
+  void update(const StorageModel &current, bool enabled, Function function) {
+    if (!enabled) return;
+    for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, function(current.read(i)));
+  }
+  template<class Predicate, class... Parameters>
+  bool camAny(Predicate predicate, Parameters... parameters) const {
+    bool result = false;
+    for (std::size_t i = 0; i < Entries; ++i)
+      result |= predicate(read(i), parameters...) != 0;
+    return result;
+  }
+  template<unsigned Offset, unsigned FieldWidth, std::size_t Base = 0>
+  void writeMask(bool enabled, std::uint64_t selected, std::uint64_t value) {
+    if (!enabled) return;
+    while (selected != 0) {
+      const auto bit = static_cast<unsigned>(__builtin_ctzll(selected));
+      write<Offset, FieldWidth>(true, Base + bit, value);
+      selected &= selected - 1;
+    }
+  }
+  template<class Predicate, class... Parameters>
+  std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
+    std::array<bool, Entries> result{};
+    for (std::size_t i = 0; i < Entries; ++i) result[i] = predicate(read(i), parameters...) != 0;
+    return result;
+  }
+  template<class Predicate, class... Parameters>
+  std::array<std::uint64_t, (Entries + 63) / 64>
+  camHitMask(Predicate predicate, Parameters... parameters) const {
+    const auto hits = camHitVec(predicate, parameters...);
+    std::array<std::uint64_t, (Entries + 63) / 64> result{};
+    std::size_t i = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // Gather eight canonical boolean bytes into eight adjacent mask bits.
+    if (sizeof(bool) == 1) {
+      for (; i + 8 <= Entries; i += 8) {
+        std::uint64_t bytes;
+        std::memcpy(&bytes, hits.data() + i, 8);
+        const auto packed = ((bytes & UINT64_C(0x0101010101010101)) *
+          UINT64_C(0x0102040810204080)) >> 56;
+        result[i / 64] |= packed << (i % 64);
+      }
+    }
+#endif
+    for (; i < Entries; ++i) result[i / 64] |= std::uint64_t(hits[i]) << (i % 64);
+    return result;
+  }
+  template<class Predicate, class... Parameters>
+  std::array<std::uint64_t, Entries> camHitIdx(Predicate predicate, Parameters... parameters) const {
+    std::array<std::uint64_t, Entries> result{};
+    result.fill(Entries);
+    std::size_t rank = 0;
+    for (std::size_t i = 0; i < Entries; ++i)
+      if (predicate(read(i), parameters...) != 0) result[rank++] = i;
+    return result;
+  }
+  template<std::size_t MaxHits> struct Matches {
+    std::array<std::uint64_t, MaxHits> values{};
+    std::array<bool, MaxHits> hits{};
+    bool overflow = false;
+  };
+  template<std::size_t MaxHits, class Predicate, class... Parameters>
+  Matches<MaxHits> camRead(Predicate predicate, Parameters... parameters) const {
+    static_assert(MaxHits > 0 && MaxHits <= Entries, "invalid CAM hit bound");
+    Matches<MaxHits> result;
+    std::size_t rank = 0;
+    for (std::size_t i = 0; i < Entries; ++i) {
+      if (predicate(read(i), parameters...) == 0) continue;
+      if (rank == MaxHits) { result.overflow = true; continue; }
+      result.values[rank] = read(i); result.hits[rank] = true; ++rank;
+    }
+    return result;
+  }
+  template<unsigned Offset, unsigned FieldWidth, class Predicate, class... Parameters>
+  void camWrite(const StorageModel &current, bool enabled, std::uint64_t value,
+                Predicate predicate, Parameters... parameters) {
+    if (!enabled) return;
+    for (std::size_t i = 0; i < Entries; ++i)
+      write<Offset, FieldWidth>(predicate(current.read(i), parameters...) != 0, i, value);
   }
   template<unsigned Offset, unsigned FieldWidth>
   void write(bool enabled, std::uint64_t index, std::uint64_t value) {
