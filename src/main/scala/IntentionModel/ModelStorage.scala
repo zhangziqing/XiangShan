@@ -119,6 +119,14 @@ class ModelStorage[T <: Data](
   override final def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit =
     recordWrite(index, field.select(gen.cloneType), content, Some(StorageLayout.path(field.path)), source)
 
+  override final def writeMask[D <: Data](mask: Seq[Bool], field: FieldOf[T, D], content: D): Unit = {
+    context()
+    require(mask.size == entries, "write mask must describe every physical slot")
+    mask.zipWithIndex.foreach { case (selected, index) =>
+      when(selected) { writeField(index.U, field, content) }
+    }
+  }
+
   private def predicate[P](
     f: (T, P) => Bool, param: P, location: SourceLoc
   ): (FunctionId, Vector[ValueId]) = param match {
