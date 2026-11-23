@@ -184,11 +184,12 @@ class ModelStorage[T <: Data](
     results.map(_.asTypeOf(prototype).readOnly)
   }
   private def camQuery[P](
-    f: (T, P) => Bool, param: P, query: CamQuery, location: SourceLoc
+    f: (T, P) => Bool, param: P, query: CamQuery, location: SourceLoc, enabled: Option[Bool] = None
   ): Vector[UInt] = {
     context()
     val (fid, params) = predicate(f, param, location)
     val types = query match {
+      case AnyMatch => Vector(UIntType(1))
       case HitVector => Vector.fill(entries)(UIntType(1))
       case HitIndices => Vector.fill(entries)(UIntType(math.max(1, BigInt(entries).bitLength)))
       case ReadMatches(n) =>
@@ -197,16 +198,17 @@ class ModelStorage[T <: Data](
     }
     val guard = capture(when.cond.asUInt, 1, UIntType(1))
     val op = builder.nextOp
-    val results = queryFunction(fid, guard, params, types, checkOverflow = query.isInstanceOf[ReadMatches])
+    val active = enabled.map(e => capture(e.asUInt, 1, UIntType(1)))
+    val results = queryFunction(fid, guard, params, types, active, query.isInstanceOf[ReadMatches])
     val ids = builder.camQuery(query, fid, guard, params,
-      results.zip(types).map { case (d, t) => (d: Data) -> t }, location)
+      results.zip(types).map { case (d, t) => (d: Data) -> t }, location, active)
     anchorResults(results, ids, op)
     results
   }
   override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
-    (enabled && camHitVec(f, arg).reduce(_ || _)).readOnly
+    camQuery(f, arg, AnyMatch, source, Some(enabled)).head.asBool.readOnly
   override final def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool): Seq[Bool] =
-    camQuery(f, arg, HitVector, source).map(value => (enabled && value.asBool).readOnly)
+    camQuery(f, arg, HitVector, source, Some(enabled)).map(_.asBool.readOnly)
   override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] =
     camQuery(f, arg, HitIndices, source).map(_.readOnly)
   override final def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int): Seq[(T, Bool)] =

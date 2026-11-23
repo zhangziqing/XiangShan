@@ -92,13 +92,14 @@ final case class WriteFieldOp(
 ) extends StorageOp
 
 sealed trait CamQuery
+case object AnyMatch extends CamQuery
 case object HitVector extends CamQuery
 case object HitIndices extends CamQuery
 final case class ReadMatches(maxHits: Int) extends CamQuery
 final case class CamQueryOp(
   id: OpId, ordinal: Int, query: CamQuery, predicate: FunctionId,
   params: Vector[Operand], results: Vector[ValueId], source: SourceLoc,
-  guard: Option[Operand] = None
+  guard: Option[Operand] = None, enabled: Option[Operand] = None
 ) extends StorageOp
 final case class CamWriteOp(
   id: OpId, ordinal: Int, guard: Operand, predicate: FunctionId,
@@ -251,10 +252,11 @@ object StorageIRCodec {
   implicit val muxRW: ReadWriter[Mux] = macroRW
   implicit val exprRW: ReadWriter[ExprNode] =
     ReadWriter.merge(fieldRefRW, paramRW, literalRW, unaryRW, binaryRW, muxRW)
+  implicit val anyMatchRW: ReadWriter[AnyMatch.type] = macroRW
   implicit val hitVecRW: ReadWriter[HitVector.type] = macroRW
   implicit val hitIdxRW: ReadWriter[HitIndices.type] = macroRW
   implicit val matchesRW: ReadWriter[ReadMatches] = macroRW
-  implicit val queryRW: ReadWriter[CamQuery] = ReadWriter.merge(hitVecRW, hitIdxRW, matchesRW)
+  implicit val queryRW: ReadWriter[CamQuery] = ReadWriter.merge(anyMatchRW, hitVecRW, hitIdxRW, matchesRW)
   implicit val readRW: ReadWriter[ReadOp] = macroRW
   implicit val writeRW: ReadWriter[WriteOp] = macroRW
   implicit val writeFieldRW: ReadWriter[WriteFieldOp] = macroRW
@@ -376,10 +378,13 @@ object StorageIRValidation {
             "read result anchor mismatch")
         case WriteOp(_, _, g, i, v, _) => guard(g); index(i); require(operand(v) == ir.entry.shape)
         case WriteFieldOp(_, _, g, i, p, v, _) => guard(g); index(i); require(operand(v) == field(Some(p)))
-        case CamQueryOp(_, _, query, p, params, rs, _, g) =>
-          g.foreach(guard)
+        case CamQueryOp(_, _, query, p, params, rs, _, g, enabled) =>
+          g.foreach(guard); enabled.foreach(guard)
+          require(enabled.isEmpty || (ir.schemaVersion >= 3 && (query == AnyMatch || query == HitVector)),
+            "explicit enable requires a mask or scalar query in schema 3")
           require(function(p, params).output.shape == UIntType(1))
           query match {
+            case AnyMatch => require(ir.schemaVersion >= 3 && rs.size == 1); result(rs.head, UIntType(1))
             case HitVector => require(rs.size == ir.entries); rs.foreach(result(_, UIntType(1)))
             case HitIndices =>
               require(rs.size == ir.entries)
@@ -545,11 +550,11 @@ final class StorageIRBuilder(
   }
   private[IntentionModel] def camQuery(
     query: CamQuery, function: FunctionId, guard: ValueId, params: Vector[ValueId],
-    results: Vector[(Data, StorageType)], source: SourceLoc
+    results: Vector[(Data, StorageType)], source: SourceLoc, enabled: Option[ValueId] = None
   ): Vector[ValueId] = {
     val op = nextOp
     val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
-    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)))
+    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)), enabled.map(Operand))
     ids
   }
   private[IntentionModel] def camWrite(

@@ -48,6 +48,13 @@ public:
     for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, function(current.read(i)));
   }
   template<class Predicate, class... Parameters>
+  bool camAny(Predicate predicate, Parameters... parameters) const {
+    bool result = false;
+    for (std::size_t i = 0; i < Entries; ++i)
+      result |= predicate(read(i), parameters...) != 0;
+    return result;
+  }
+  template<class Predicate, class... Parameters>
   std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
     std::array<bool, Entries> result{};
     for (std::size_t i = 0; i < Entries; ++i) result[i] = predicate(read(i), parameters...) != 0;
