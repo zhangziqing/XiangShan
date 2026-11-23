@@ -32,6 +32,10 @@ public:
     for (std::size_t i = 0; i < Entries; ++i)
       state_[i] = static_cast<Entry>(initial[i] & mask(Width));
   }
+  void resetMasked(const State &initial, const State &masks) {
+    for (std::size_t i = 0; i < Entries; ++i)
+      state_[i] = static_cast<Entry>((state_[i] & ~masks[i]) | (initial[i] & masks[i]));
+  }
   template<class Function>
   std::array<std::uint64_t, Entries> foreach(Function function) const {
     std::array<std::uint64_t, Entries> result{};

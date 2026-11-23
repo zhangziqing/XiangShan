@@ -42,11 +42,7 @@ class ModelStorage[T <: Data](
     case None => UnspecifiedInitialState
     case Some(values) =>
       require(values.size == entries, "initial contents must describe every entry")
-      ConstantInitialState(values.map { value =>
-        val bits = value.litOption.getOrElse(
-          throw new IllegalArgumentException("ModelStorage initialization requires complete constants"))
-        bits & StorageLayout.mask(layout.totalWidth)
-      }.toVector)
+      chisel3.StorageLiteral.initial(values, layout)
   }
   private val builder = new StorageIRBuilder(session.allocate(), entries, layout, initial)
   private val wires = ArrayBuffer.empty[UInt]
@@ -229,7 +225,7 @@ class ModelStorage[T <: Data](
     val widths = ports.map(port => builder.data(port.index).getWidth -> builder.data(port.value).getWidth)
     val callbackInputs = StorageCyclePacking.callbackOperands(builder.operations)
     val extraWidths = callbackInputs.map { case (name, value) => name -> builder.data(value).getWidth }
-    val cycle = Module(new StorageCycleBridge(builder.id, widths, initial.isInstanceOf[ConstantInitialState],
+    val cycle = Module(new StorageCycleBridge(builder.id, widths, initial != UnspecifiedInitialState,
       extraWidths, StorageCyclePacking.callbackGuards(builder.operations)))
     callbackInputs.foreach { case (name, value) => connections += cycle.io.extra(name) -> builder.data(value) }
     cycle.io.clock := clock
@@ -490,6 +486,9 @@ object StorageDPIEmitter {
       val initial = ir.initial match {
         case ConstantInitialState(bits) =>
           s"static const Model_${ir.id.value}::State initial_${ir.id.value}{{${bits.map(u).mkString(", ")}}};"
+        case MaskedInitialState(bits, masks) =>
+          s"static const Model_${ir.id.value}::State initial_${ir.id.value}{{${bits.map(u).mkString(", ")}}};\n" +
+            s"static const Model_${ir.id.value}::State reset_masks_${ir.id.value}{{${masks.map(u).mkString(", ")}}};"
         case UnspecifiedInitialState => ""
       }
       s"""using Model_${ir.id.value} = intention::StorageModel<${ir.entries}, ${ir.entry.totalWidth}>;
@@ -528,7 +527,13 @@ object StorageDPIEmitter {
       val reset = ir.initial match {
         case _: ConstantInitialState =>
           s"if (${operand("reset")}) { next.reset(initial_${ir.id.value}); return; }"
+        case _: MaskedInitialState => ""
         case UnspecifiedInitialState => "(void)inputs_0;"
+      }
+      val partialReset = ir.initial match {
+        case _: MaskedInitialState =>
+          s"if (${operand("reset")}) next.resetMasked(initial_${ir.id.value}, reset_masks_${ir.id.value});"
+        case _ => ""
       }
       val writeIndices = specs.zipWithIndex.map { case ((id, offset, width), i) => id -> (i, offset, width) }.toMap
       val writes = ir.operations.flatMap {
@@ -548,9 +553,10 @@ object StorageDPIEmitter {
          |  const auto &current = storage_${ir.id.value}[epoch != 0];
          |  next = current;
          |  $writes
+         |  $partialReset
          |}""".stripMargin
     }.mkString("\n")
-    s"""// Generated from storage IR schema 1/2. Do not edit.
+    s"""// Generated from storage IR schema 1/2/3. Do not edit.
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"

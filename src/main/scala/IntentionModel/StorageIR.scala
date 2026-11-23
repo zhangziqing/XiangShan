@@ -52,6 +52,7 @@ final case class ResetSpec(signal: SignalRef, synchronous: Boolean, activeHigh: 
 sealed trait InitialState
 case object UnspecifiedInitialState extends InitialState
 final case class ConstantInitialState(bits: Vector[BigInt]) extends InitialState
+final case class MaskedInitialState(bits: Vector[BigInt], masks: Vector[BigInt]) extends InitialState
 
 sealed trait UnaryOp
 case object BitNot extends UnaryOp
@@ -229,7 +230,8 @@ object StorageIRCodec {
   implicit val resetRW: ReadWriter[ResetSpec] = macroRW
   implicit val unspecifiedRW: ReadWriter[UnspecifiedInitialState.type] = macroRW
   implicit val initialBitsRW: ReadWriter[ConstantInitialState] = macroRW
-  implicit val initialRW: ReadWriter[InitialState] = ReadWriter.merge(unspecifiedRW, initialBitsRW)
+  implicit val maskedInitialRW: ReadWriter[MaskedInitialState] = macroRW
+  implicit val initialRW: ReadWriter[InitialState] = ReadWriter.merge(unspecifiedRW, initialBitsRW, maskedInitialRW)
   implicit val bitNotRW: ReadWriter[BitNot.type] = macroRW
   implicit val negateRW: ReadWriter[Negate.type] = macroRW
   implicit val unaryOpRW: ReadWriter[UnaryOp] = ReadWriter.merge(bitNotRW, negateRW)
@@ -276,7 +278,7 @@ object StorageIRCodec {
 
 object StorageIRValidation {
   def validate(ir: StorageIR): Unit = {
-    require(Set(1, 2)(ir.schemaVersion), "unsupported storage IR schema")
+    require(Set(1, 2, 3)(ir.schemaVersion), "unsupported storage IR schema")
     require(ir.schemaVersion >= 2 || ir.functions.isEmpty, "schema 1 cannot contain functions")
     require(ir.id.value >= 0 && ir.entries > 0, "invalid storage identity or capacity")
     require(ir.entry == StorageLayout(ir.entry.shape), "inconsistent entry layout or packing")
@@ -289,6 +291,13 @@ object StorageIRValidation {
       case ConstantInitialState(values) =>
         require(values.size == ir.entries, "initial state must describe every entry")
         values.foreach(bits(_, ir.entry.shape))
+      case MaskedInitialState(values, masks) =>
+        require(ir.schemaVersion >= 3, "masked reset requires schema 3")
+        require(values.size == ir.entries && masks.size == ir.entries, "reset must describe every entry")
+        values.zip(masks).foreach { case (value, mask) =>
+          bits(value, ir.entry.shape); bits(mask, ir.entry.shape)
+          require((value & ~mask) == 0, "initial bits outside reset coverage")
+        }
       case UnspecifiedInitialState => ()
     }
     require(ir.values.map(_.id).distinct.size == ir.values.size, "duplicate value ID")
@@ -573,7 +582,7 @@ final class StorageIRBuilder(
     val byId = definitions.map(f => f.id -> f).toMap
     val functions = functionIds.map(fid => byId.getOrElse(fid,
       throw new IllegalArgumentException(s"function $fid has not been lowered"))).toVector
-    val ir = StorageIR(2, id, Some(instancePath), entries, layout, clock, reset, initial,
+    val ir = StorageIR(3, id, Some(instancePath), entries, layout, clock, reset, initial,
       values, Vector.empty, ops.toVector, functions)
     StorageIRValidation.requireDPI(ir)
     sealedIR = Some(ir)
