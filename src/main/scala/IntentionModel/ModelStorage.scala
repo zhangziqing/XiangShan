@@ -146,7 +146,7 @@ class ModelStorage[T <: Data](
     case _ => throw new IllegalArgumentException("CAM parameter must be Data or an immutable Scala scalar")
   }
   private def queryFunction(
-    function: FunctionId, guard: ValueId, params: Vector[ValueId], types: Vector[StorageType],
+    function: FunctionId, params: Vector[ValueId], types: Vector[StorageType],
     enabled: Option[ValueId] = None, checkOverflow: Boolean = false
   ): Vector[UInt] = {
     val bridge = Module(new StorageFunctionQueryBridge(builder.id, builder.nextOp, function,
@@ -154,7 +154,6 @@ class ModelStorage[T <: Data](
     functionQueries += bridge
     // Use the caller's clock, reset and when scope, just like RegStorage.camRead.
     if (checkOverflow) chisel3.assert(!bridge.io.overflow, "camRead hit count exceeds maxHits")
-    connections += bridge.io.enabled -> builder.data(guard)
     val active = enabled.getOrElse(capture(true.B.asUInt, 1, UIntType(1)))
     connections += bridge.io.active -> builder.data(active)
     params.zipWithIndex.foreach { case (value, i) => connections += bridge.io.parameter(i) -> builder.data(value) }
@@ -174,8 +173,7 @@ class ModelStorage[T <: Data](
     val (fid, prototype) = builder.function(() => gen.cloneType, None,
       (entry: T, _: Option[Data]) => f(entry), None, location)
     val tpe = StorageLayout.fromData(prototype).shape
-    val guard = capture(when.cond.asUInt, 1, UIntType(1))
-    val results = queryFunction(fid, guard, Vector.empty, Vector.fill(entries)(tpe))
+    val results = queryFunction(fid, Vector.empty, Vector.fill(entries)(tpe))
     builder.foreach(fid, results.map(x => x: Data), tpe, location)
     results.map(_.asTypeOf(prototype).readOnly)
   }
@@ -192,10 +190,9 @@ class ModelStorage[T <: Data](
         require(n > 0 && n <= entries, "camRead maxHits must be between 1 and entries")
         Vector.fill(n)(Vector(layout.shape, UIntType(1))).flatten
     }
-    val guard = capture(when.cond.asUInt, 1, UIntType(1))
     val active = enabled.map(e => capture(e.asUInt, 1, UIntType(1)))
-    val results = queryFunction(fid, guard, params, types, active, query.isInstanceOf[ReadMatches])
-    builder.camQuery(query, fid, guard, params,
+    val results = queryFunction(fid, params, types, active, query.isInstanceOf[ReadMatches])
+    builder.camQuery(query, fid, params,
       results.zip(types).map { case (d, t) => (d: Data) -> t }, location, active)
     results
   }
