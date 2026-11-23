@@ -122,9 +122,16 @@ class ModelStorage[T <: Data](
   override final def writeMask[D <: Data](mask: Seq[Bool], field: FieldOf[T, D], content: D): Unit = {
     context()
     require(mask.size == entries, "write mask must describe every physical slot")
-    mask.zipWithIndex.foreach { case (selected, index) =>
-      when(selected) { writeField(index.U, field, content) }
-    }
+    val guard = capture((when.cond && VecInit(mask).asUInt.orR).asUInt, 1, UIntType(1))
+    val masks = mask.grouped(64).map { word =>
+      capture(VecInit(word).asUInt, word.size, UIntType(word.size))
+    }.toVector
+    val normalized = Wire(field.select(gen.cloneType).cloneType)
+    normalized := content
+    val path = StorageLayout.path(field.path)
+    val tpe = StorageLayout.field(layout, path)._1
+    val value = capture(normalized.asUInt, StorageLayout.width(tpe), tpe)
+    builder.writeMask(guard, masks, path, value, source)
   }
 
   private def predicate[P](
@@ -390,11 +397,16 @@ object StorageCyclePacking {
       Vector(s"function_guard_${id.value}" -> guard.value) ++
         params.zipWithIndex.map { case (p, i) => s"function_parameter_${id.value}_$i" -> p.value } :+
         (s"function_value_${id.value}" -> value.value)
+    case WriteMaskOp(id, _, guard, masks, _, value, _) =>
+      Vector(s"function_guard_${id.value}" -> guard.value) ++
+        masks.zipWithIndex.map { case (m, i) => s"function_mask_${id.value}_$i" -> m.value } :+
+        (s"function_value_${id.value}" -> value.value)
     case _ => Vector.empty
   }
   def callbackGuards(operations: Vector[StorageOp]): Vector[String] = operations.collect {
     case op: UpdateOp => s"function_guard_${op.id.value}"
     case op: CamWriteOp => s"function_guard_${op.id.value}"
+    case op: WriteMaskOp => s"function_guard_${op.id.value}"
   }
   def fromIR(ir: StorageIR): StorageCyclePacking = {
     val types = ir.values.map(v => v.id -> v.tpe).toMap
@@ -552,6 +564,11 @@ object StorageDPIEmitter {
         case op if writeIndices.contains(op.id.value) =>
           val (i, offset, width) = writeIndices(op.id.value)
           Some(s"next.write<$offset, $width>(${operand(s"guard_$i")} != 0, ${operand(s"index_$i")}, ${operand(s"value_$i")});")
+        case op: WriteMaskOp =>
+          val (_, offset, width) = StorageLayout.field(ir.entry, op.fieldPath)
+          Some(op.masks.indices.map { i =>
+            s"next.writeMask<$offset, $width, ${i * 64}>(${operand(s"function_guard_${op.id.value}")} != 0, ${operand(s"function_mask_${op.id.value}_$i")}, ${operand(s"function_value_${op.id.value}")});"
+          }.mkString("\n"))
         case op: UpdateOp => Some(s"next.update(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${StorageFunctionCpp.name(op.transform)});")
         case op: CamWriteOp =>
           val (_, offset, width) = op.fieldPath.map(StorageLayout.field(ir.entry, _)).getOrElse((ir.entry.shape, 0, ir.entry.totalWidth))

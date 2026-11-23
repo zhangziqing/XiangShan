@@ -54,6 +54,15 @@ public:
       result |= predicate(read(i), parameters...) != 0;
     return result;
   }
+  template<unsigned Offset, unsigned FieldWidth, std::size_t Base = 0>
+  void writeMask(bool enabled, std::uint64_t selected, std::uint64_t value) {
+    if (!enabled) return;
+    while (selected != 0) {
+      const auto bit = static_cast<unsigned>(__builtin_ctzll(selected));
+      write<Offset, FieldWidth>(true, Base + bit, value);
+      selected &= selected - 1;
+    }
+  }
   template<class Predicate, class... Parameters>
   std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
     std::array<bool, Entries> result{};

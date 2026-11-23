@@ -91,6 +91,11 @@ final case class WriteFieldOp(
   fieldPath: Vector[FieldStep], value: Operand, source: SourceLoc
 ) extends StorageOp
 
+final case class WriteMaskOp(
+  id: OpId, ordinal: Int, guard: Operand, masks: Vector[Operand],
+  fieldPath: Vector[FieldStep], value: Operand, source: SourceLoc
+) extends StorageOp
+
 sealed trait CamQuery
 case object AnyMatch extends CamQuery
 case object HitVector extends CamQuery
@@ -259,6 +264,7 @@ object StorageIRCodec {
   implicit val queryRW: ReadWriter[CamQuery] = ReadWriter.merge(anyMatchRW, hitVecRW, hitIdxRW, matchesRW)
   implicit val readRW: ReadWriter[ReadOp] = macroRW
   implicit val writeRW: ReadWriter[WriteOp] = macroRW
+  implicit val writeMaskRW: ReadWriter[WriteMaskOp] = macroRW
   implicit val writeFieldRW: ReadWriter[WriteFieldOp] = macroRW
   implicit val functionIdRW: ReadWriter[FunctionId] = macroRW
   implicit val camQueryRW: ReadWriter[CamQueryOp] = macroRW
@@ -266,7 +272,7 @@ object StorageIRCodec {
   implicit val updateRW: ReadWriter[UpdateOp] = macroRW
   implicit val foreachRW: ReadWriter[ForeachOp] = macroRW
   implicit val opRW: ReadWriter[StorageOp] =
-    ReadWriter.merge(readRW, writeRW, writeFieldRW, camQueryRW, camWriteRW, updateRW, foreachRW)
+    ReadWriter.merge(readRW, writeRW, writeFieldRW, writeMaskRW, camQueryRW, camWriteRW, updateRW, foreachRW)
   implicit val functionDefRW: ReadWriter[StorageFunctionDef] = macroRW
   implicit val irRW: ReadWriter[StorageIR] = macroRW
 
@@ -378,6 +384,13 @@ object StorageIRValidation {
             "read result anchor mismatch")
         case WriteOp(_, _, g, i, v, _) => guard(g); index(i); require(operand(v) == ir.entry.shape)
         case WriteFieldOp(_, _, g, i, p, v, _) => guard(g); index(i); require(operand(v) == field(Some(p)))
+        case WriteMaskOp(_, _, g, masks, path, v, _) =>
+          require(ir.schemaVersion >= 3, "physical mask writes require schema 3")
+          guard(g); require(operand(v) == field(Some(path)))
+          require(masks.size == (ir.entries + 63) / 64, "invalid physical mask length")
+          masks.zipWithIndex.foreach { case (m, i) =>
+            require(operand(m) == UIntType(math.min(64, ir.entries - i * 64)), "invalid mask word")
+          }
         case CamQueryOp(_, _, query, p, params, rs, _, g, enabled) =>
           g.foreach(guard); enabled.foreach(guard)
           require(enabled.isEmpty || (ir.schemaVersion >= 3 && (query == AnyMatch || query == HitVector)),
@@ -534,6 +547,12 @@ final class StorageIRBuilder(
       case None => WriteOp(op, ops.size, Operand(guard), Operand(index), Operand(value), source)
     })
     ports += StorageWritePort(op, guard, index, value, offset, width)
+  }
+  private[IntentionModel] def writeMask(
+    guard: ValueId, masks: Vector[ValueId], path: Vector[FieldStep], value: ValueId, source: SourceLoc
+  ): Unit = {
+    val op = nextOp
+    ops += WriteMaskOp(op, ops.size, Operand(guard), masks.map(Operand), path, Operand(value), source)
   }
   private[IntentionModel] def operations: Vector[StorageOp] = ops.toVector
   private[IntentionModel] def update(guard: ValueId, function: FunctionId, source: SourceLoc): Unit = {
