@@ -407,8 +407,9 @@ object StorageIRValidation {
     require(ir.expressions.isEmpty, "callback expression lowering is not implemented")
     ir.functions.foreach(StorageFunctionCpp.function)
     ir.operations.foreach {
-      case _: ReadOp | _: WriteOp | _: WriteFieldOp => ()
-      case _ => throw new IllegalArgumentException("CAM/update/foreach DPI lowering is not implemented")
+      case _: UpdateOp | _: CamWriteOp =>
+        throw new IllegalArgumentException("update/camWrite DPI lowering is not implemented")
+      case _ => ()
     }
     val types = ir.values.map(v => v.id -> v.tpe).toMap
     ir.operations.foreach {
