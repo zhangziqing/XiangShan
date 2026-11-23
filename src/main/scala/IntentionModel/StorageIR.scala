@@ -104,7 +104,7 @@ final case class ReadMatches(maxHits: Int) extends CamQuery
 final case class CamQueryOp(
   id: OpId, ordinal: Int, query: CamQuery, predicate: FunctionId,
   params: Vector[Operand], results: Vector[ValueId], source: SourceLoc,
-  guard: Option[Operand] = None
+  guard: Option[Operand] = None, enabled: Option[Operand] = None
 ) extends StorageOp
 final case class CamWriteOp(
   id: OpId, ordinal: Int, guard: Operand, predicate: FunctionId,
@@ -391,8 +391,11 @@ object StorageIRValidation {
           masks.zipWithIndex.foreach { case (m, i) =>
             require(operand(m) == UIntType(math.min(64, ir.entries - i * 64)), "invalid mask word")
           }
-        case CamQueryOp(_, _, query, p, params, rs, _, g) =>
-          g.foreach(guard); require(function(p, params).output.shape == UIntType(1))
+        case CamQueryOp(_, _, query, p, params, rs, _, g, enabled) =>
+          g.foreach(guard); enabled.foreach(guard)
+          require(enabled.isEmpty || (ir.schemaVersion >= 3 && (query == AnyMatch || query == HitVector)),
+            "explicit enable requires a mask or scalar query in schema 3")
+          require(function(p, params).output.shape == UIntType(1))
           query match {
             case AnyMatch => require(ir.schemaVersion >= 3 && rs.size == 1); result(rs.head, UIntType(1))
             case HitVector => require(rs.size == ir.entries); rs.foreach(result(_, UIntType(1)))
@@ -566,11 +569,11 @@ final class StorageIRBuilder(
   }
   private[IntentionModel] def camQuery(
     query: CamQuery, function: FunctionId, guard: ValueId, params: Vector[ValueId],
-    results: Vector[(Data, StorageType)], source: SourceLoc
+    results: Vector[(Data, StorageType)], source: SourceLoc, enabled: Option[ValueId] = None
   ): Vector[ValueId] = {
     val op = nextOp
     val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
-    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)))
+    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)), enabled.map(Operand))
     ids
   }
   private[IntentionModel] def camWrite(
