@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 package IntentionModel
 
-import chisel3.{Bundle, Data, Record, SInt, UInt, Vec}
+import chisel3._
 import firrtl.AnnotationSeq
 import firrtl.annotations.TargetToken
 import firrtl.annotations.{NoTargetAnnotation, ReferenceTarget, SingleTargetAnnotation}
@@ -95,18 +95,19 @@ case object HitVector extends CamQuery
 case object HitIndices extends CamQuery
 final case class ReadMatches(maxHits: Int) extends CamQuery
 final case class CamQueryOp(
-  id: OpId, ordinal: Int, query: CamQuery, predicate: ExprId,
-  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc
+  id: OpId, ordinal: Int, query: CamQuery, predicate: FunctionId,
+  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc,
+  guard: Option[Operand] = None
 ) extends StorageOp
 final case class CamWriteOp(
-  id: OpId, ordinal: Int, guard: Operand, predicate: ExprId,
+  id: OpId, ordinal: Int, guard: Operand, predicate: FunctionId,
   params: Vector[Operand], fieldPath: Option[Vector[FieldStep]], value: Operand, source: SourceLoc
 ) extends StorageOp
 final case class UpdateOp(
-  id: OpId, ordinal: Int, guard: Operand, transform: ExprId, source: SourceLoc
+  id: OpId, ordinal: Int, guard: Operand, transform: FunctionId, source: SourceLoc
 ) extends StorageOp
 final case class ForeachOp(
-  id: OpId, ordinal: Int, transform: ExprId, results: Vector[ValueId], source: SourceLoc
+  id: OpId, ordinal: Int, transform: FunctionId, results: Vector[ValueId], source: SourceLoc
 ) extends StorageOp
 
 /** Immutable boundary IR: no Chisel objects, callbacks, or runtime state. */
@@ -121,7 +122,8 @@ final case class StorageIR(
   initial: InitialState,
   values: Vector[StorageValue],
   expressions: Vector[ExprNode],
-  operations: Vector[StorageOp]
+  operations: Vector[StorageOp],
+  functions: Vector[StorageFunctionDef] = Vector.empty
 )
 
 object StorageLayout {
@@ -254,12 +256,14 @@ object StorageIRCodec {
   implicit val readRW: ReadWriter[ReadOp] = macroRW
   implicit val writeRW: ReadWriter[WriteOp] = macroRW
   implicit val writeFieldRW: ReadWriter[WriteFieldOp] = macroRW
+  implicit val functionIdRW: ReadWriter[FunctionId] = macroRW
   implicit val camQueryRW: ReadWriter[CamQueryOp] = macroRW
   implicit val camWriteRW: ReadWriter[CamWriteOp] = macroRW
   implicit val updateRW: ReadWriter[UpdateOp] = macroRW
   implicit val foreachRW: ReadWriter[ForeachOp] = macroRW
   implicit val opRW: ReadWriter[StorageOp] =
     ReadWriter.merge(readRW, writeRW, writeFieldRW, camQueryRW, camWriteRW, updateRW, foreachRW)
+  implicit val functionDefRW: ReadWriter[StorageFunctionDef] = macroRW
   implicit val irRW: ReadWriter[StorageIR] = macroRW
 
   def encode(ir: StorageIR): String = { StorageIRValidation.validate(ir); write(ir, indent = 2) }
@@ -272,7 +276,8 @@ object StorageIRCodec {
 
 object StorageIRValidation {
   def validate(ir: StorageIR): Unit = {
-    require(ir.schemaVersion == 1, "unsupported storage IR schema")
+    require(Set(1, 2)(ir.schemaVersion), "unsupported storage IR schema")
+    require(ir.schemaVersion >= 2 || ir.functions.isEmpty, "schema 1 cannot contain functions")
     require(ir.id.value >= 0 && ir.entries > 0, "invalid storage identity or capacity")
     require(ir.entry == StorageLayout(ir.entry.shape), "inconsistent entry layout or packing")
     require(ir.clock.target.nonEmpty && ir.clock.tpe == UIntType(1), "invalid clock reference")
@@ -325,6 +330,21 @@ object StorageIRValidation {
       }
       expressions(e.id) = e.resultType
     }
+    require(ir.functions.map(_.id).distinct.size == ir.functions.size, "duplicate function ID")
+    ir.functions.foreach { f =>
+      require(f.id.value >= 0 && f.module.nonEmpty && f.chirrtl.nonEmpty && f.firrtl.nonEmpty,
+        "invalid function identity or body")
+      require(f.inputs.nonEmpty && f.inputClasses.size == f.inputs.size && f.inputClasses.forall(_.nonEmpty) && f.outputClass.nonEmpty,
+        "invalid function capture metadata")
+      require(f.source.file.nonEmpty && f.source.line > 0 && f.source.column.forall(_ > 0), "invalid function source")
+      (f.inputs :+ f.output).foreach(l => require(l == StorageLayout(l.shape), "invalid function layout"))
+    }
+    val functions = ir.functions.map(f => f.id -> f).toMap
+    def function(id: FunctionId, params: Vector[Operand]): StorageFunctionDef = {
+      val f = functions.getOrElse(id, throw new IllegalArgumentException(s"unresolved function $id"))
+      require(f.inputs.map(_.shape) == Vector(ir.entry.shape) ++ params.map(operand), "function signature mismatch")
+      f
+    }
     require(ir.operations.map(_.id).distinct.size == ir.operations.size, "duplicate operation ID")
     require(ir.operations.map(_.ordinal) == ir.operations.indices.toVector, "non-contiguous operation order")
     val results = scala.collection.mutable.Set.empty[ValueId]
@@ -347,8 +367,9 @@ object StorageIRValidation {
             "read result anchor mismatch")
         case WriteOp(_, _, g, i, v, _) => guard(g); index(i); require(operand(v) == ir.entry.shape)
         case WriteFieldOp(_, _, g, i, p, v, _) => guard(g); index(i); require(operand(v) == field(Some(p)))
-        case CamQueryOp(_, _, query, p, params, rs, _) =>
-          require(expr(p) == UIntType(1)); params.foreach(operand)
+        case CamQueryOp(_, _, query, p, params, rs, _, g) =>
+          g.foreach(guard)
+          require(function(p, params).output.shape == UIntType(1))
           query match {
             case HitVector => require(rs.size == ir.entries); rs.foreach(result(_, UIntType(1)))
             case HitIndices =>
@@ -359,14 +380,21 @@ object StorageIRValidation {
               rs.grouped(2).foreach(pair => { result(pair(0), ir.entry.shape); result(pair(1), UIntType(1)) })
           }
         case CamWriteOp(_, _, g, p, params, path, v, _) =>
-          guard(g); require(expr(p) == UIntType(1)); params.foreach(operand); require(operand(v) == field(path))
-        case UpdateOp(_, _, g, transform, _) => guard(g); require(expr(transform) == ir.entry.shape)
+          guard(g); require(function(p, params).output.shape == UIntType(1)); require(operand(v) == field(path))
+        case UpdateOp(_, _, g, transform, _) => guard(g); require(function(transform, Vector.empty).output.shape == ir.entry.shape)
         case ForeachOp(_, _, transform, rs, _) =>
-          require(rs.size == ir.entries); rs.foreach(result(_, expr(transform)))
+          require(rs.size == ir.entries); rs.foreach(result(_, function(transform, Vector.empty).output.shape))
       }
     }
+    val resultOwners = ir.operations.flatMap {
+      case op: ReadOp => Vector(op.result -> op.id)
+      case op: ForeachOp => op.results.map(_ -> op.id)
+      case op: CamQueryOp => op.results.map(_ -> op.id)
+      case _ => Vector.empty
+    }.toMap
     ir.values.foreach { v => v.binding match {
-      case ReadResultValue(_, _) => require(results(v.id), "orphaned read result")
+      case ReadResultValue(op, _) =>
+        require(results(v.id) && resultOwners.get(v.id).contains(op), "orphaned or mismatched result anchor")
       case _ => ()
     } }
   }
@@ -406,6 +434,9 @@ private[IntentionModel] final case class StorageWiringAnnotation(
   connections: Vector[(ReferenceTarget, ReferenceTarget)]
 ) extends NoTargetAnnotation with Unserializable
 
+private[IntentionModel] final case class StoragePendingIRAnnotation(finish: () => StorageIR)
+  extends NoTargetAnnotation with Unserializable
+
 final case class StorageIRAnnotation(json: String) extends NoTargetAnnotation with Unserializable {
   def ir: StorageIR = StorageIRCodec.decode(json)
 }
@@ -414,6 +445,18 @@ final case class StorageIRAnnotation(json: String) extends NoTargetAnnotation wi
 final class StorageIRSession {
   private var nextId = 0L
   private val artifacts = ArrayBuffer.empty[StorageIR]
+  private var nextFunctionId = 0L
+  private val functionArtifacts = ArrayBuffer.empty[StorageFunctionDef]
+  private[IntentionModel] def allocateFunction(): FunctionId = {
+    val id = FunctionId(nextFunctionId)
+    nextFunctionId = Math.addExact(nextFunctionId, 1L)
+    id
+  }
+  private[IntentionModel] def recordFunction(f: StorageFunctionDef): Unit = {
+    require(!functionArtifacts.exists(_.id == f.id), "duplicate function ID")
+    functionArtifacts += f
+  }
+  def functions: Vector[StorageFunctionDef] = functionArtifacts.toVector
   private[IntentionModel] def allocate(): StorageId = {
     val id = StorageId(nextId)
     nextId = Math.addExact(nextId, 1L)
@@ -438,6 +481,20 @@ final class StorageIRBuilder(
   private val captured = ArrayBuffer.empty[Captured]
   private val ops = ArrayBuffer.empty[StorageOp]
   private val ports = ArrayBuffer.empty[StorageWritePort]
+  private val functionIds = ArrayBuffer.empty[FunctionId]
+
+  private[IntentionModel] def function[T <: Data, R <: Data](
+    makeInput: () => T, makeParam: Option[() => Data],
+    callback: (T, Option[Data]) => R, normalize: Option[() => R], source: SourceLoc
+  )(implicit session: StorageIRSession): (FunctionId, R) = {
+    open()
+    val fid = session.allocateFunction()
+    val module = chisel3.Module(new StorageFunctionModule(fid, makeInput, makeParam,
+      callback, normalize, source, session))
+    module.arguments.foreach(_ := 0.U)
+    functionIds += fid
+    (fid, module.resultType)
+  }
   private var closed = false
   private var sealedIR: Option[StorageIR] = None
   private def open(): Unit = require(!closed && sealedIR.isEmpty, "storage capture is closed")
@@ -467,13 +524,43 @@ final class StorageIRBuilder(
     })
     ports += StorageWritePort(op, guard, index, value, offset, width)
   }
+  private[IntentionModel] def operations: Vector[StorageOp] = ops.toVector
+  private[IntentionModel] def update(guard: ValueId, function: FunctionId, source: SourceLoc): Unit = {
+    val op = nextOp
+    ops += UpdateOp(op, ops.size, Operand(guard), function, source)
+  }
+  private[IntentionModel] def foreach(
+    function: FunctionId, results: Vector[Data], tpe: StorageType, source: SourceLoc
+  ): Vector[ValueId] = {
+    val op = nextOp
+    val ids = results.map(capture(_, tpe, Some(op)))
+    ops += ForeachOp(op, ops.size, function, ids, source)
+    ids
+  }
+  private[IntentionModel] def camQuery(
+    query: CamQuery, function: FunctionId, guard: ValueId, params: Vector[ValueId],
+    results: Vector[(Data, StorageType)], source: SourceLoc
+  ): Vector[ValueId] = {
+    val op = nextOp
+    val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
+    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)))
+    ids
+  }
+  private[IntentionModel] def camWrite(
+    function: FunctionId, guard: ValueId, params: Vector[ValueId], path: Option[Vector[FieldStep]],
+    value: ValueId, source: SourceLoc
+  ): Unit = {
+    val op = nextOp
+    ops += CamWriteOp(op, ops.size, Operand(guard), function, params.map(Operand), path, Operand(value), source)
+  }
   private[IntentionModel] def writes: Vector[StorageWritePort] = ports.toVector
   private[IntentionModel] def data(id: ValueId): Data = captured(id.value).data
   private[IntentionModel] def closeCapture(): Unit = { open(); closed = true }
 
   /** Called explicitly by the Stage annotation conversion after elaboration. */
   def seal(
-    instancePath: String, clock: SignalRef, reset: ResetSpec, resolve: Data => SignalRef
+    instancePath: String, clock: SignalRef, reset: ResetSpec, resolve: Data => SignalRef,
+    definitions: Vector[StorageFunctionDef] = Vector.empty
   ): StorageIR = sealedIR.getOrElse {
     require(closed, "close capture before sealing")
     val values = captured.map { c =>
@@ -486,13 +573,17 @@ final class StorageIRBuilder(
       }
       StorageValue(c.id, c.tpe, binding)
     }.toVector
-    val ir = StorageIR(1, id, Some(instancePath), entries, layout, clock, reset, initial,
-      values, Vector.empty, ops.toVector)
+    val byId = definitions.map(f => f.id -> f).toMap
+    val functions = functionIds.map(fid => byId.getOrElse(fid,
+      throw new IllegalArgumentException(s"function $fid has not been lowered"))).toVector
+    val ir = StorageIR(2, id, Some(instancePath), entries, layout, clock, reset, initial,
+      values, Vector.empty, ops.toVector, functions)
     StorageIRValidation.requireDPI(ir)
     sealedIR = Some(ir)
     captured.clear()
     ops.clear()
     ports.clear()
+    functionIds.clear()
     ir
   }
 }
