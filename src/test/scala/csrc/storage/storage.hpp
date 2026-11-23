@@ -38,6 +38,11 @@ public:
     for (std::size_t i = 0; i < Entries; ++i) result[i] = function(read(i));
     return result;
   }
+  template<class Function>
+  void update(const StorageModel &current, bool enabled, Function function) {
+    if (!enabled) return;
+    for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, function(current.read(i)));
+  }
   template<class Predicate, class... Parameters>
   std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
     std::array<bool, Entries> result{};
@@ -90,6 +95,13 @@ public:
       result.values[rank] = read(i); result.hits[rank] = true; ++rank;
     }
     return result;
+  }
+  template<unsigned Offset, unsigned FieldWidth, class Predicate, class... Parameters>
+  void camWrite(const StorageModel &current, bool enabled, std::uint64_t value,
+                Predicate predicate, Parameters... parameters) {
+    if (!enabled) return;
+    for (std::size_t i = 0; i < Entries; ++i)
+      write<Offset, FieldWidth>(predicate(current.read(i), parameters...) != 0, i, value);
   }
   template<unsigned Offset, unsigned FieldWidth>
   void write(bool enabled, std::uint64_t index, std::uint64_t value) {

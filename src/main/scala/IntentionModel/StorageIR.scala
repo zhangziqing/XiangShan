@@ -406,11 +406,6 @@ object StorageIRValidation {
     require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
     require(ir.expressions.isEmpty, "callback expression lowering is not implemented")
     ir.functions.foreach(StorageFunctionCpp.function)
-    ir.operations.foreach {
-      case _: UpdateOp | _: CamWriteOp =>
-        throw new IllegalArgumentException("update/camWrite DPI lowering is not implemented")
-      case _ => ()
-    }
     val types = ir.values.map(v => v.id -> v.tpe).toMap
     ir.operations.foreach {
       case ReadOp(_, _, i, _, _) => require(StorageLayout.width(types(i.value)) <= 64, "index exceeds 64 bits")
