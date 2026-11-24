@@ -20,7 +20,8 @@ final case class StorageFunctionDef(
   inputClasses: Vector[String],
   outputClass: String,
   chirrtl: String,
-  firrtl: String
+  firrtl: String,
+  systemVerilog: String = ""
 )
 
 private[IntentionModel] final case class StorageFunctionCaptureAnnotation(
@@ -81,8 +82,9 @@ class StorageFunctionPhase extends Phase {
       val module = modules(a.module).asInstanceOf[firrtl.ir.Module]
       val original = firrtl.ir.Circuit(firrtl.ir.NoInfo, Seq(module), module.name).serialize
       val lowered = StorageFunctionLowering(module)
+      val systemVerilog = StorageFunctionCompiler(module, annotations)
       a.session.recordFunction(StorageFunctionDef(a.id, a.module, a.source,
-        a.inputs, a.output, a.inputClasses, a.outputClass, original, lowered))
+        a.inputs, a.output, a.inputClasses, a.outputClass, original, lowered, systemVerilog))
     }
     annotations.flatMap {
       case _: StorageFunctionCaptureAnnotation => Seq.empty
