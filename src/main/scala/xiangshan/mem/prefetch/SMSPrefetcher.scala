@@ -29,7 +29,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
 import utils._
-import utils.QueueModel.{OverrideableQueue, QueueRTL}
+import utils.QueueModel.{OverrideableQueue, QueueRTL, SmsTrainFilterQueue}
 import utility._
 import xiangshan._
 import xiangshan.backend.fu.PMPRespBundle
@@ -1125,30 +1125,15 @@ class SMSTrainFilter()(implicit p: Parameters) extends XSModule with HasSMSModul
     val train_req = ValidIO(new PrefetchReqBundle())
   })
 
-  class Ptr(implicit p: Parameters) extends CircularQueuePtr[Ptr](
-    p => smsParams.train_filter_size
-  ){
-  }
-
-  object Ptr {
-    def apply(f: Bool, v: UInt)(implicit p: Parameters): Ptr = {
-      val ptr = Wire(new Ptr)
-      ptr.flag := f
-      ptr.value := v
-      ptr
-    }
-  }
-
-  val entries = RegInit(VecInit(Seq.fill(smsParams.train_filter_size){ (0.U.asTypeOf(new PrefetchReqBundle())) }))
-  val valids = RegInit(VecInit(Seq.fill(smsParams.train_filter_size){ (false.B) }))
-
   val enqLen = backendParams.LduCnt + backendParams.StaCnt
-  val enqPtrExt = RegInit(VecInit((0 until enqLen).map(_.U.asTypeOf(new Ptr))))
-  val deqPtrExt = RegInit(0.U.asTypeOf(new Ptr))
-
-  val deqPtr = WireInit(deqPtrExt.value)
-
   require(smsParams.train_filter_size >= enqLen)
+
+  // Storage, pointer wrap, packed admission and old-state peeks move to the
+  // owner-local ring. The parent keeps the lossy dedup policy and the legacy
+  // pointer-comparison admission, so a same-cycle dequeue gives no credit.
+  val queue = Module(new SmsTrainFilterQueue(
+    new PrefetchReqBundle, smsParams.train_filter_size, enqLen
+  ).emitRTL())
 
   val ld_reorder = reorder(io.ld_in)
   val st_reorder = reorder(io.st_in)
@@ -1160,46 +1145,29 @@ class SMSTrainFilter()(implicit p: Parameters) extends XSModule with HasSMSModul
   for(i <- (0 until enqLen)) {
     val req = reqs_ls(i)
     val req_v = reqs_vls(i)
-    val index = PopCount(needAlloc.take(i))
-    val allocPtr = enqPtrExt(index)
-    val entry_match = Cat(entries.zip(valids).map {
-      case(e, v) => v && block_hash_tag(e.vaddr) === block_hash_tag(req.vaddr)
+    val entry_match = Cat((0 until smsParams.train_filter_size).map { j =>
+      queue.io.peek(j).valid && block_hash_tag(queue.io.peek(j).bits.vaddr) === block_hash_tag(req.vaddr)
     }).orR
     val prev_enq_match = if(i == 0) false.B else Cat(reqs_ls.zip(reqs_vls).take(i).map {
       case(pre, pre_v) => pre_v && block_hash_tag(pre.vaddr) === block_hash_tag(req.vaddr)
     }).orR
 
     needAlloc(i) := req_v && !entry_match && !prev_enq_match
-    canAlloc(i) := needAlloc(i) && allocPtr >= deqPtrExt
-
-    when(canAlloc(i)) {
-      valids(allocPtr.value) := true.B
-      entries(allocPtr.value) := req
-    }
+    queue.io.enqNeed(i) := needAlloc(i)
+    queue.io.enqBits(i) := req
+    canAlloc(i) := queue.io.enqAccepted(i)
   }
   val allocNum = PopCount(canAlloc)
 
-  enqPtrExt.foreach{case x => when(canAlloc.asUInt.orR) {x := x + allocNum} }
+  // `train_req` is ValidIO and always drains; the queue consumes exactly one
+  // valid head per cycle, leaving stale payload visible when invalid.
+  io.train_req.valid := queue.io.deq.valid
+  io.train_req.bits := queue.io.deq.bits
 
-  io.train_req.valid := false.B
-  io.train_req.bits := DontCare
-  valids.zip(entries).zipWithIndex.foreach {
-    case((valid, entry), i) => {
-      when(deqPtr === i.U) {
-        io.train_req.valid := valid
-        io.train_req.bits := entry
-      }
-    }
-  }
-
-  when(io.train_req.valid) {
-    valids(deqPtr) := false.B
-    deqPtrExt := deqPtrExt + 1.U
-  }
-
-  XSPerfAccumulate("sms_train_filter_full", PopCount(valids) === (smsParams.train_filter_size).U)
-  XSPerfAccumulate("sms_train_filter_half", PopCount(valids) >= (smsParams.train_filter_size / 2).U)
-  XSPerfAccumulate("sms_train_filter_empty", PopCount(valids) === 0.U)
+  val occupied = PopCount((0 until smsParams.train_filter_size).map(queue.io.peek(_).valid))
+  XSPerfAccumulate("sms_train_filter_full", occupied === smsParams.train_filter_size.U)
+  XSPerfAccumulate("sms_train_filter_half", occupied >= (smsParams.train_filter_size / 2).U)
+  XSPerfAccumulate("sms_train_filter_empty", occupied === 0.U)
 
   val raw_enq_pattern = Cat(reqs_vls)
   val filtered_enq_pattern = Cat(needAlloc)

@@ -33,10 +33,10 @@ import freechips.rocketchip.tilelink.TLPermissions._
 import freechips.rocketchip.tilelink.{ClientMetadata, ClientStates, TLPermissions}
 import xiangshan.backend.rob.RobDebugRollingIO
 import utils._
+import utils.QueueModel.CounterFilterQueue
 import utility._
 import xiangshan.{L1CacheErrorInfo, XSCoreParamsKey}
 import xiangshan.mem.HasL1PrefetchSourceParameter
-import utility.{CircularQueuePtr}
 import xiangshan.cache._
 import xiangshan.{XSBundle, XSModule}
 
@@ -70,76 +70,50 @@ class CounterFilter()(implicit p: Parameters) extends DCacheModule {
 
   val LduStages = 4 + 1 // +1 is for prefetch wirte in next cycle of s3
   val SIZE = (LduStages) * LduCnt
-  class Ptr(implicit p: Parameters) extends CircularQueuePtr[Ptr]( p => SIZE ){}
-  object Ptr {
-    def apply(f: Bool, v: UInt)(implicit p: Parameters): Ptr = {
-      val ptr = Wire(new Ptr)
-      ptr.flag := f
-      ptr.value := v
-      ptr
-    }
-  }
-
-  val entries = RegInit(VecInit(Seq.fill(SIZE){ (0.U.asTypeOf(new CounterFilterDataBundle())) }))
-  val valids = RegInit(VecInit(Seq.fill(SIZE){ (false.B) }))
-
-  // enq
   val enqLen = LduCnt
   val deqLen = LduCnt
-  val enqPtrExt = RegInit(VecInit((0 until enqLen).map(_.U.asTypeOf(new Ptr))))
-  val deqPtrExt = RegInit(VecInit((0 until deqLen).map(_.U.asTypeOf(new Ptr))))
 
-  val deqPtr = WireInit(deqPtrExt(0).value)
+  // Owner-local ring keeps the legacy circular-pointer admission, old-state
+  // CAM visibility and the four-register delayed retirement. The adapter
+  // registers its enqueue/retire policy in its constructor, so emission stays
+  // inside the queue's Module construction.
+  val queue = Module(new CounterFilterQueue(
+    new CounterFilterDataBundle(), SIZE, enqLen, deqLen, log2Ceil(LduCnt + 1)
+  ).emitRTL())
 
   val reqs_l = io.ld_in.map(_.bits)
   val reqs_vl = io.ld_in.map(_.valid)
-  val needAlloc = Wire(Vec(enqLen, Bool()))
   val canAlloc = Wire(Vec(enqLen, Bool()))
-  val last3CycleAlloc = RegInit(0.U(log2Ceil(LduCnt + 1).W))
 
+  // Admission uses the old circular pointers and packed rank with no credit
+  // for a same-cycle retirement. The legacy assertion that a needed lane is
+  // always accepted is retained.
   for(i <- (0 until enqLen)) {
-    val req = reqs_l(i)
-    val req_v = reqs_vl(i)
-    val index = PopCount(needAlloc.take(i))
-    val allocPtr = enqPtrExt(index)
-
-    needAlloc(i) := req_v
-    canAlloc(i) := needAlloc(i) && allocPtr >= deqPtrExt(0)
-
-    when(canAlloc(i)) {
-      valids(allocPtr.value) := true.B
-      entries(allocPtr.value) := req
-    }
-
-    assert(!needAlloc(i) || canAlloc(i), s"port${i} can not accept CounterFilter enq request, check if SIZE >= (Ldu stages + 1) * LduCnt")
+    queue.io.enqNeed(i) := reqs_vl(i)
+    queue.io.enqBits(i) := reqs_l(i)
+    canAlloc(i) := queue.io.enqAccepted(i)
+    assert(!reqs_vl(i) || canAlloc(i), s"port${i} can not accept CounterFilter enq request, check if SIZE >= (Ldu stages + 1) * LduCnt")
   }
   val allocNum = PopCount(canAlloc)
 
-  enqPtrExt.foreach{case x => 
-    when(canAlloc.asUInt.orR){
-      x := x + allocNum
-    }
-  }
+  // Exact legacy retirement: three unreset RegNext delays plus the reset
+  // holding register. Do not replace this with a dense occupancy counter.
+  val last3CycleAlloc = RegInit(0.U(log2Ceil(LduCnt + 1).W))
   last3CycleAlloc := RegNext(RegNext(RegNext(allocNum)))
 
-  // deq
-  for(i <- (0 until deqLen)) {
-    when(i.U < last3CycleAlloc) {
-      valids(deqPtrExt(i).value) := false.B
-    }
-  }
+  // Retire the oldest prefix and advance the head unconditionally by the
+  // registered count, including when it exceeds current occupancy.
+  queue.io.retireCount := last3CycleAlloc
 
-  deqPtrExt.foreach{case x => x := x + last3CycleAlloc}
-
-  // query
+  // query: all-slot CAM over the storage's old state, through the peek ports
   val querys_l = io.query.map(_.req.bits)
   val querys_vl = io.query.map(_.req.valid)
-  for(i <- (0 until LduCnt + HyuCnt)) {
+  for(i <- 0 until LduCnt + HyuCnt) {
     val q = querys_l(i)
     val q_v = querys_vl(i)
 
-    val entry_match = Cat(entries.zip(valids).map {
-      case(e, v) => v && (q.idx === e.idx) && (q.way === e.way)
+    val entry_match = Cat((0 until SIZE).map { j =>
+      queue.io.peek(j).valid && (q.idx === queue.io.peek(j).bits.idx) && (q.way === queue.io.peek(j).bits.way)
     }).orR
 
     io.query(i).resp := q_v && entry_match
