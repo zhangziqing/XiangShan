@@ -7,6 +7,13 @@ import firrtl.stage.{FirrtlCircuitAnnotation, OutputFileAnnotation}
 
 /** Check the callback contract before optimization, then use Chisel's CIRCT phase. */
 private[IntentionModel] object StorageFunctionCompiler {
+  /** Replay descriptors captured before SystemVerilog was saved in the function. */
+  def fromChirrtl(source: String): String = {
+    val binary = firtoolresolver.Resolve(chisel3.BuildInfo.firtoolVersion.get, true)
+      .fold(message => throw new IllegalStateException(message), _.path.toString)
+    os.proc(binary, "-format=fir", "--disable-all-randomization").call(stdin = source).out.text()
+  }
+
   private def unsupported(value: Any): Nothing =
     throw new IllegalArgumentException(s"unsupported pure function hardware: $value")
 

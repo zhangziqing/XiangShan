@@ -468,7 +468,7 @@ object StorageDPIEmitter {
     require(models.map(_.id).distinct.size == models.size, "duplicate storage ID in executable")
     val ordered = models.sortBy(_.id.value)
     val functions = functionDefinitions(models)
-    val functionInclude = if (functions.isEmpty) "" else "#include \"storage_functions.hpp\""
+    val functionInclude = if (functions.isEmpty) "" else "#include \"storage_functions.hpp\"\n#include \"storage_functions.inc\""
     def u(bits: BigInt): String = s"UINT64_C(0x${bits.toString(16)})"
     val storageModels = ordered.map { ir =>
       val initial = ir.initial match {
@@ -607,7 +607,7 @@ object StorageDescriptorMain {
       require(new String(Files.readAllBytes(source), UTF_8) == expected, "generated Storage DPI C++ is stale")
       println(s"Validated ${models.size} storage descriptors and generated DPI C++")
     } else {
-      Files.write(source, expected.getBytes(UTF_8))
+      StorageDPIEmitter.emit(models, directory)
       println(s"Generated DPI C++ from ${models.size} storage descriptors")
     }
   }
