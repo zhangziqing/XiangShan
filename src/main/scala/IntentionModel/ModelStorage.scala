@@ -503,7 +503,7 @@ object StorageDPIEmitter {
   def emit(models: Vector[StorageIR], directory: Path): Unit = {
     val source = cpp(models)
     val functions = functionDefinitions(models)
-    StorageFunctionArtifacts.emit(functions, directory)
+    StorageFunctionArtifacts.emit(functions, directory, models)
     Files.createDirectories(directory)
     val stale = Files.newDirectoryStream(directory, "storage-*.json")
     try {
