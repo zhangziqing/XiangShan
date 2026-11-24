@@ -547,11 +547,11 @@ object StorageDPIEmitter {
           Some(op.masks.indices.map { i =>
             s"next.writeMask<$offset, $width, ${i * 64}>(${operand(s"function_guard_${op.id.value}")} != 0, ${operand(s"function_mask_${op.id.value}_$i")}, ${operand(s"function_value_${op.id.value}")});"
           }.mkString("\n"))
-        case op: UpdateOp => Some(s"next.update(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${StorageFunctionCpp.name(op.transform)});")
+        case op: UpdateOp => Some(s"next.update(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${StorageFunctionCpp.batchName(op.transform)}{});")
         case op: CamWriteOp =>
           val (_, offset, width) = op.fieldPath.map(StorageLayout.field(ir.entry, _)).getOrElse((ir.entry.shape, 0, ir.entry.totalWidth))
           val params = op.params.indices.map(i => s", ${operand(s"function_parameter_${op.id.value}_$i")}").mkString
-          Some(s"next.camWrite<$offset, $width>(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${operand(s"function_value_${op.id.value}")}, ${StorageFunctionCpp.name(op.predicate)}$params);")
+          Some(s"next.camWrite<$offset, $width>(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${operand(s"function_value_${op.id.value}")}, ${StorageFunctionCpp.batchName(op.predicate)}{}$params);")
         case _ => None
       }.mkString("\n")
       s"""extern "C" void ${cycleName(ir.id)}(svBit epoch, $args) {
@@ -586,7 +586,7 @@ object StorageDPIEmitter {
   def emit(models: Vector[StorageIR], directory: Path): Unit = {
     val source = cpp(models)
     val functions = functionDefinitions(models)
-    StorageFunctionArtifacts.emit(functions, directory)
+    StorageFunctionArtifacts.emit(functions, directory, models)
     Files.createDirectories(directory)
     val stale = Files.newDirectoryStream(directory, "storage-*.json")
     try {
