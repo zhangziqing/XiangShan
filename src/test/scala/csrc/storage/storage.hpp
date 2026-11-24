@@ -26,12 +26,12 @@ private:
   State state_{};
   template<class Function, class... Parameters>
   std::array<std::uint64_t, Entries> evaluate(Function function, Parameters... parameters) const {
-    if constexpr (std::is_invocable_v<Function, const State&, Parameters...>) {
-      return function(state_, parameters...);
-    } else {
+    if constexpr (std::is_invocable_v<Function, std::uint64_t, Parameters...>) {
       std::array<std::uint64_t, Entries> result{};
       for (std::size_t i = 0; i < Entries; ++i) result[i] = function(state_[i], parameters...);
       return result;
+    } else {
+      return function(state_, parameters...);
     }
   }
 public:
