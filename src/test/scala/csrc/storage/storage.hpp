@@ -24,6 +24,16 @@ public:
   using State = std::array<Entry, Entries>;
 private:
   State state_{};
+  template<class Function, class... Parameters>
+  std::array<std::uint64_t, Entries> evaluate(Function function, Parameters... parameters) const {
+    if constexpr (std::is_invocable_v<Function, const State&, Parameters...>) {
+      return function(state_, parameters...);
+    } else {
+      std::array<std::uint64_t, Entries> result{};
+      for (std::size_t i = 0; i < Entries; ++i) result[i] = function(state_[i], parameters...);
+      return result;
+    }
+  }
 public:
   std::uint64_t read(std::uint64_t index) const {
     return index < Entries ? state_[static_cast<std::size_t>(index)] : 0;
@@ -38,19 +48,19 @@ public:
   }
   template<class Function>
   std::array<std::uint64_t, Entries> foreach(Function function) const {
-    std::array<std::uint64_t, Entries> result{};
-    for (std::size_t i = 0; i < Entries; ++i) result[i] = function(read(i));
-    return result;
+    return evaluate(function);
   }
   template<class Function>
   void update(const StorageModel &current, bool enabled, Function function) {
     if (!enabled) return;
-    for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, function(current.read(i)));
+    const auto values = current.evaluate(function);
+    for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, values[i]);
   }
   template<class Predicate, class... Parameters>
   std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
+    const auto values = evaluate(predicate, parameters...);
     std::array<bool, Entries> result{};
-    for (std::size_t i = 0; i < Entries; ++i) result[i] = predicate(read(i), parameters...) != 0;
+    for (std::size_t i = 0; i < Entries; ++i) result[i] = values[i] != 0;
     return result;
   }
   template<class Predicate, class... Parameters>
@@ -76,11 +86,12 @@ public:
   }
   template<class Predicate, class... Parameters>
   std::array<std::uint64_t, Entries> camHitIdx(Predicate predicate, Parameters... parameters) const {
+    const auto values = evaluate(predicate, parameters...);
     std::array<std::uint64_t, Entries> result{};
     result.fill(Entries);
     std::size_t rank = 0;
     for (std::size_t i = 0; i < Entries; ++i)
-      if (predicate(read(i), parameters...) != 0) result[rank++] = i;
+      if (values[i] != 0) result[rank++] = i;
     return result;
   }
   template<std::size_t MaxHits> struct Matches {
@@ -91,10 +102,11 @@ public:
   template<std::size_t MaxHits, class Predicate, class... Parameters>
   Matches<MaxHits> camRead(Predicate predicate, Parameters... parameters) const {
     static_assert(MaxHits > 0 && MaxHits <= Entries, "invalid CAM hit bound");
+    const auto values = evaluate(predicate, parameters...);
     Matches<MaxHits> result;
     std::size_t rank = 0;
     for (std::size_t i = 0; i < Entries; ++i) {
-      if (predicate(read(i), parameters...) == 0) continue;
+      if (values[i] == 0) continue;
       if (rank == MaxHits) { result.overflow = true; continue; }
       result.values[rank] = read(i); result.hits[rank] = true; ++rank;
     }
@@ -104,8 +116,9 @@ public:
   void camWrite(const StorageModel &current, bool enabled, std::uint64_t value,
                 Predicate predicate, Parameters... parameters) {
     if (!enabled) return;
+    const auto matches = current.evaluate(predicate, parameters...);
     for (std::size_t i = 0; i < Entries; ++i)
-      write<Offset, FieldWidth>(predicate(current.read(i), parameters...) != 0, i, value);
+      write<Offset, FieldWidth>(matches[i] != 0, i, value);
   }
   template<unsigned Offset, unsigned FieldWidth>
   void write(bool enabled, std::uint64_t index, std::uint64_t value) {

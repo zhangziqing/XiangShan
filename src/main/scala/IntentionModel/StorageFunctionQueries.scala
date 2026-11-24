@@ -36,7 +36,7 @@ object StorageFunctionQueries {
     val clear = (0 until packing.words).map(i => s"*word_$i = 0;").mkString("\n")
     val overflow = query match { case Some(_: ReadMatches) => "values.overflow"; case _ => "0" }
     s"""extern "C" void ${name(ir.id, op)}(svBit epoch$args, svBit *overflow) {
-       |  const auto values = storage_${ir.id.value}[epoch != 0].$method(${StorageFunctionCpp.name(function)}$parameters);
+       |  const auto values = storage_${ir.id.value}[epoch != 0].$method(${StorageFunctionCpp.batchName(function)}{}$parameters);
        |  $clear
        |  $values
        |  *overflow = $overflow;
