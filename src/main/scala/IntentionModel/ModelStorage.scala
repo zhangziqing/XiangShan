@@ -93,11 +93,7 @@ class ModelStorage[T <: Data](
         batchReads += capturedIndex -> result
         result
     }
-    val (op, result) = builder.read(capturedIndex, value, location)
-    annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = StorageReadResultAnnotation(value.toAbsoluteTarget,
-        builder.id.value, op.value, result.value)
-    })
+    builder.read(capturedIndex, value, location)
     value.asTypeOf(gen).readOnly
   }
   override final def read(index: Int): T = {
@@ -139,7 +135,7 @@ class ModelStorage[T <: Data](
     case _ => throw new IllegalArgumentException("CAM parameter must be Data or an immutable Scala scalar")
   }
   private def queryFunction(
-    function: FunctionId, guard: ValueId, params: Vector[ValueId], types: Vector[StorageType],
+    function: FunctionId, params: Vector[ValueId], types: Vector[StorageType],
     enabled: Option[ValueId] = None, checkOverflow: Boolean = false
   ): Vector[UInt] = {
     val bridge = Module(new StorageFunctionQueryBridge(builder.id, builder.nextOp, function,
@@ -147,17 +143,11 @@ class ModelStorage[T <: Data](
     functionQueries += bridge
     // Use the caller's clock, reset and when scope, just like RegStorage.camRead.
     if (checkOverflow) chisel3.assert(!bridge.io.overflow, "camRead hit count exceeds maxHits")
-    connections += bridge.io.enabled -> builder.data(guard)
     val active = enabled.getOrElse(capture(true.B.asUInt, 1, UIntType(1)))
     connections += bridge.io.active -> builder.data(active)
     params.zipWithIndex.foreach { case (value, i) => connections += bridge.io.parameter(i) -> builder.data(value) }
     types.indices.map(bridge.io.value).toVector
   }
-  private def anchorResults(results: Vector[UInt], ids: Vector[ValueId], op: OpId): Unit =
-    results.zip(ids).foreach { case (data, id) => annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = StorageReadResultAnnotation(data.toAbsoluteTarget, builder.id.value, op.value, id.value)
-    }) }
-
   private def unsupported[A](operation: String): A =
     throw new IllegalArgumentException(s"ModelStorage $operation callback lowering is not implemented")
   override final def update(f: T => T): Unit = unsupported("update")
@@ -167,11 +157,8 @@ class ModelStorage[T <: Data](
     val (fid, prototype) = builder.function(() => gen.cloneType, None,
       (entry: T, _: Option[Data]) => f(entry), None, location)
     val tpe = StorageLayout.fromData(prototype).shape
-    val guard = capture(when.cond.asUInt, 1, UIntType(1))
-    val op = builder.nextOp
-    val results = queryFunction(fid, guard, Vector.empty, Vector.fill(entries)(tpe))
-    val ids = builder.foreach(fid, results.map(x => x: Data), tpe, location)
-    anchorResults(results, ids, op)
+    val results = queryFunction(fid, Vector.empty, Vector.fill(entries)(tpe))
+    builder.foreach(fid, results.map(x => x: Data), tpe, location)
     results.map(_.asTypeOf(prototype).readOnly)
   }
   private def camQuery[P](
@@ -186,12 +173,9 @@ class ModelStorage[T <: Data](
         require(n > 0 && n <= entries, "camRead maxHits must be between 1 and entries")
         Vector.fill(n)(Vector(layout.shape, UIntType(1))).flatten
     }
-    val guard = capture(when.cond.asUInt, 1, UIntType(1))
-    val op = builder.nextOp
-    val results = queryFunction(fid, guard, params, types, checkOverflow = query.isInstanceOf[ReadMatches])
-    val ids = builder.camQuery(query, fid, guard, params,
+    val results = queryFunction(fid, params, types, checkOverflow = query.isInstanceOf[ReadMatches])
+    builder.camQuery(query, fid, params,
       results.zip(types).map { case (d, t) => (d: Data) -> t }, location)
-    anchorResults(results, ids, op)
     results
   }
   override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
@@ -244,16 +228,10 @@ class ModelStorage[T <: Data](
             synchronous = true, activeHigh = true),
           data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)), session.functions)
         session.record(ir)
-        ir
       })
     })
   })
 }
-
-/** Compatibility alias for explicitly constructed synchronous software models.
-  * Backend-independent modules use IntentionCallback and the Storage declaration.
-  */
-trait StorageModelOwner extends RequireSyncReset with IntentionCallback
 
 sealed trait StorageReadBridgeMode
 object StorageReadBridgeMode {
@@ -645,26 +623,5 @@ object StorageModelStage {
     val result = Storage.withBackend(implementation)(generate(session))
     if (option.backend != StorageBackend.RTL) artifacts(session.models, build, Paths.get(option.runtimeHeader))
     result
-  }
-
-  /** Compatibility entry point for explicitly instantiated ModelStorage. */
-  def emit(generator: StorageIRSession => RawModule, buildDirectory: Path): Vector[StorageIR] =
-    emit(generator, buildDirectory, defaultRuntime)
-
-  def emit(
-    generator: StorageIRSession => RawModule,
-    buildDirectory: Path,
-    runtimeHeader: Path
-  ): Vector[StorageIR] = {
-    require(Files.isRegularFile(runtimeHeader), s"Storage runtime header is missing: $runtimeHeader")
-    val build = buildDirectory.toAbsolutePath.normalize()
-    val session = new StorageIRSession
-    (new top.XiangShanStage).execute(
-      Array("--target", "systemverilog", "--target-dir", build.resolve(".storage-stage").toString),
-      Seq(ChiselGeneratorAnnotation(() => generator(session)), FirtoolOption("--split-verilog"),
-        FirtoolOption(s"-o=${build.resolve("rtl")}")))
-    val models = session.models
-    artifacts(models, build, runtimeHeader)
-    models
   }
 }
