@@ -22,7 +22,7 @@ object StorageFunctionArtifacts {
     val generated = """function-([0-9]+)\.(json|chirrtl\.fir|lowered\.fir)""".r
     val stream = Files.newDirectoryStream(directory, "function-*")
     try stream.iterator().asScala.foreach { path => path.getFileName.toString match {
-      case generated(id, _) if !keep(id) => Files.delete(path)
+      case generated(id, suffix) if !keep(id) || suffix == "lowered.fir" => Files.delete(path)
       case _ => ()
     }} finally stream.close()
     def write(name: String, value: String): Unit =
@@ -31,7 +31,6 @@ object StorageFunctionArtifacts {
     ordered.foreach { f =>
       write(s"function-${f.id.value}.json", upickle.default.write(f, indent = 2))
       write(s"function-${f.id.value}.chirrtl.fir", f.chirrtl)
-      write(s"function-${f.id.value}.lowered.fir", f.firrtl)
     }
     val output = directory.resolve("storage_functions")
     remove(output)
@@ -51,7 +50,7 @@ object StorageFunctionArtifacts {
       val bodies = ordered.map(f => if (f.systemVerilog.nonEmpty) f.systemVerilog
         else StorageFunctionCompiler.fromChirrtl(f.chirrtl)).mkString("\n")
       write("storage_functions.sv", s"module IntentionFunctions(\n  $ports\n);\n$instances\nendmodule\n$bodies")
-      val log = new StringBuilder
+      val log = new java.lang.StringBuffer
       val status = Process(Seq("verilator", "--cc", "--no-timing", "--threads", "1",
         "--prefix", StorageFunctionCpp.prefix, "--top-module", "IntentionFunctions",
         "--Mdir", output.toAbsolutePath.toString, directory.resolve("storage_functions.sv").toAbsolutePath.toString))
