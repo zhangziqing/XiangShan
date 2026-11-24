@@ -28,7 +28,7 @@ private:
   std::array<std::uint64_t, Entries> evaluate(Function function, Parameters... parameters) const {
     if constexpr (std::is_invocable_v<Function, std::uint64_t, Parameters...>) {
       std::array<std::uint64_t, Entries> result{};
-      for (std::size_t i = 0; i < Entries; ++i) result[i] = function(state_[i], parameters...);
+      for (std::size_t i = 0; i < Entries; ++i) result[i] = function(read(i), parameters...);
       return result;
     } else {
       return function(state_, parameters...);
