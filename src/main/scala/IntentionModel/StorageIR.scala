@@ -269,7 +269,7 @@ object StorageIRValidation {
     }
     require(ir.functions.map(_.id).distinct.size == ir.functions.size, "duplicate function ID")
     ir.functions.foreach { f =>
-      require(f.id.value >= 0 && f.module.nonEmpty && f.chirrtl.nonEmpty && f.firrtl.nonEmpty,
+      require(f.id.value >= 0 && f.module.nonEmpty && f.chirrtl.nonEmpty,
         "invalid function identity or body")
       require(f.inputs.nonEmpty && f.inputClasses.size == f.inputs.size && f.inputClasses.forall(_.nonEmpty) && f.outputClass.nonEmpty,
         "invalid function capture metadata")
