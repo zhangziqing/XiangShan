@@ -20,7 +20,6 @@ final case class StorageFunctionDef(
   inputClasses: Vector[String],
   outputClass: String,
   chirrtl: String,
-  firrtl: String,
   systemVerilog: String = ""
 )
 
@@ -81,10 +80,9 @@ class StorageFunctionPhase extends Phase {
     functions.foreach { a =>
       val module = modules(a.module).asInstanceOf[firrtl.ir.Module]
       val original = firrtl.ir.Circuit(firrtl.ir.NoInfo, Seq(module), module.name).serialize
-      val lowered = StorageFunctionLowering(module)
       val systemVerilog = StorageFunctionCompiler(module, annotations)
       a.session.recordFunction(StorageFunctionDef(a.id, a.module, a.source,
-        a.inputs, a.output, a.inputClasses, a.outputClass, original, lowered, systemVerilog))
+        a.inputs, a.output, a.inputClasses, a.outputClass, original, systemVerilog))
     }
     annotations.flatMap {
       case _: StorageFunctionCaptureAnnotation => Seq.empty
