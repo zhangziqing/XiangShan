@@ -3,47 +3,69 @@ package IntentionModel
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
+import scala.jdk.CollectionConverters._
+import scala.sys.process.{Process, ProcessLogger}
 
-/** A replayable record of invocation, original circuit, lowering and C++ output. */
+/** Replay captured circuits through the standard CIRCT and Verilator compilers. */
 object StorageFunctionArtifacts {
-  private[IntentionModel] lazy val bitsHeader: String = {
-    val stream = Option(getClass.getResourceAsStream("/IntentionModel/bits.hpp"))
-      .getOrElse(throw new IllegalStateException("missing packaged Bits runtime"))
-    val source = scala.io.Source.fromInputStream(stream, "UTF-8")
-    try source.mkString finally source.close()
+  private def remove(path: Path): Unit = if (Files.exists(path)) {
+    val files = Files.walk(path)
+    try files.iterator().asScala.toVector.sortBy(_.getNameCount).reverse.foreach(Files.delete(_))
+    finally files.close()
   }
 
   def emit(functions: Vector[StorageFunctionDef], directory: Path): Unit = {
     import StorageIRCodec._
     val header = StorageFunctionCpp.header(functions)
-    val runtime = if (functions.nonEmpty) Some(bitsHeader) else None
     Files.createDirectories(directory)
     val keep = functions.map(_.id.value.toString).toSet
     val generated = """function-([0-9]+)\.(json|chirrtl\.fir|lowered\.fir)""".r
     val stream = Files.newDirectoryStream(directory, "function-*")
-    try {
-      val iterator = stream.iterator()
-      while (iterator.hasNext) {
-        val path = iterator.next()
-        path.getFileName.toString match {
-          case generated(id, _) if !keep(id) => Files.delete(path)
-          case _ => ()
-        }
-      }
-    } finally stream.close()
+    try stream.iterator().asScala.foreach { path => path.getFileName.toString match {
+      case generated(id, _) if !keep(id) => Files.delete(path)
+      case _ => ()
+    }} finally stream.close()
     def write(name: String, value: String): Unit =
       Files.write(directory.resolve(name), value.getBytes(UTF_8))
-    functions.sortBy(_.id.value).foreach { f =>
+    val ordered = functions.sortBy(_.id.value)
+    ordered.foreach { f =>
       write(s"function-${f.id.value}.json", upickle.default.write(f, indent = 2))
       write(s"function-${f.id.value}.chirrtl.fir", f.chirrtl)
       write(s"function-${f.id.value}.lowered.fir", f.firrtl)
     }
+    val output = directory.resolve("storage_functions")
+    remove(output)
+    Files.deleteIfExists(directory.resolve("bits.hpp"))
     if (functions.nonEmpty) {
-      write("bits.hpp", runtime.get)
+      def port(f: StorageFunctionDef, name: String): String = StorageFunctionCpp.port(f.id, name)
+      val ports = ordered.flatMap { f =>
+        f.inputs.zipWithIndex.map { case (layout, i) =>
+          s"input [${layout.totalWidth - 1}:0] ${port(f, s"argument_$i")}"
+        } :+ s"output [${f.output.totalWidth - 1}:0] ${port(f, "result")}"
+      }.mkString(",\n  ")
+      val instances = ordered.map { f =>
+        val connections = (f.inputs.indices.map(i => s"argument_$i") :+ "result")
+          .map(n => s".$n(${port(f, n)})").mkString(", ")
+        s"  ${f.module} function_${f.id.value}($connections);"
+      }.mkString("\n")
+      val bodies = ordered.map(f => if (f.systemVerilog.nonEmpty) f.systemVerilog
+        else StorageFunctionCompiler.fromChirrtl(f.chirrtl)).mkString("\n")
+      write("storage_functions.sv", s"module IntentionFunctions(\n  $ports\n);\n$instances\nendmodule\n$bodies")
+      val log = new StringBuilder
+      val status = Process(Seq("verilator", "--cc", "--no-timing", "--threads", "1",
+        "--prefix", StorageFunctionCpp.prefix, "--top-module", "IntentionFunctions",
+        "--Mdir", output.toAbsolutePath.toString, directory.resolve("storage_functions.sv").toAbsolutePath.toString))
+        .!(ProcessLogger(line => log.append(line).append('\n'), line => log.append(line).append('\n')))
+      require(status == 0, s"Verilator failed for Storage callbacks:\n$log")
+      val files = Files.newDirectoryStream(output, "*.cpp")
+      val sources = try files.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { file =>
+        s"#include \"${directory.relativize(file).toString}\""
+      } finally files.close()
       write("storage_functions.hpp", header)
+      write("storage_functions.inc", sources.mkString("\n") + "\n")
     } else {
-      Files.deleteIfExists(directory.resolve("storage_functions.hpp"))
-      Files.deleteIfExists(directory.resolve("bits.hpp"))
+      Seq("storage_functions.hpp", "storage_functions.inc", "storage_functions.sv")
+        .foreach(name => Files.deleteIfExists(directory.resolve(name)))
     }
   }
 }
