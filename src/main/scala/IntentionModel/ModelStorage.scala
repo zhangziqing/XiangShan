@@ -92,11 +92,7 @@ class ModelStorage[T <: Data](
         batchReads += capturedIndex -> result
         result
     }
-    val (op, result) = builder.read(capturedIndex, value, location)
-    annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = StorageReadResultAnnotation(value.toAbsoluteTarget,
-        builder.id.value, op.value, result.value)
-    })
+    builder.read(capturedIndex, value, location)
     value.asTypeOf(gen).readOnly
   }
   override final def read(index: Int): T = {
@@ -176,11 +172,6 @@ class ModelStorage[T <: Data](
     })
   })
 }
-
-/** Compatibility alias for explicitly constructed synchronous software models.
-  * Backend-independent modules use IntentionCallback and the Storage declaration.
-  */
-trait StorageModelOwner extends RequireSyncReset with IntentionCallback
 
 sealed trait StorageReadBridgeMode
 object StorageReadBridgeMode {
@@ -424,7 +415,7 @@ object StorageDPIEmitter {
          |  $writes
          |}""".stripMargin
     }.mkString("\n")
-    s"""// Generated from storage IR schema 1. Do not edit.
+    s"""// Generated from storage IR. Do not edit.
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
@@ -566,26 +557,5 @@ object StorageModelStage {
     val result = Storage.withBackend(implementation)(generate(session))
     if (option.backend != StorageBackend.RTL) artifacts(session.models, build, Paths.get(option.runtimeHeader))
     result
-  }
-
-  /** Compatibility entry point for explicitly instantiated ModelStorage. */
-  def emit(generator: StorageIRSession => RawModule, buildDirectory: Path): Vector[StorageIR] =
-    emit(generator, buildDirectory, defaultRuntime)
-
-  def emit(
-    generator: StorageIRSession => RawModule,
-    buildDirectory: Path,
-    runtimeHeader: Path
-  ): Vector[StorageIR] = {
-    require(Files.isRegularFile(runtimeHeader), s"Storage runtime header is missing: $runtimeHeader")
-    val build = buildDirectory.toAbsolutePath.normalize()
-    val session = new StorageIRSession
-    (new top.XiangShanStage).execute(
-      Array("--target", "systemverilog", "--target-dir", build.resolve(".storage-stage").toString),
-      Seq(ChiselGeneratorAnnotation(() => generator(session)), FirtoolOption("--split-verilog"),
-        FirtoolOption(s"-o=${build.resolve("rtl")}")))
-    val models = session.models
-    artifacts(models, build, runtimeHeader)
-    models
   }
 }
