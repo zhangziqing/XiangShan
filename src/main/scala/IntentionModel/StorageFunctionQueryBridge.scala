@@ -22,20 +22,18 @@ private[IntentionModel] class StorageFunctionQueryIO(
   parameters: Vector[Int], results: Vector[Int], exposeOverflow: Boolean
 ) extends Record {
   private val packing = StorageQueryPacking(results)
-  val elements = ListMap((Seq("epoch" -> Input(Bool()), "enabled" -> Input(Bool()), "active" -> Input(Bool())) ++
+  val elements = ListMap((Seq("epoch" -> Input(Bool()), "active" -> Input(Bool())) ++
     parameters.zipWithIndex.map { case (w, i) => s"parameter_$i" -> Input(UInt(w.W)) } ++
     (0 until packing.words).map(i => s"word_$i" -> Output(UInt(64.W))) ++
     (if (exposeOverflow) Seq("overflow" -> Output(Bool())) else Seq.empty)): _*)
   def overflow: Bool = elements("overflow").asInstanceOf[Bool]
   def epoch: Bool = elements("epoch").asInstanceOf[Bool]
   def active: Bool = elements("active").asInstanceOf[Bool]
-  def enabled: Bool = elements("enabled").asInstanceOf[Bool]
   def parameter(i: Int): UInt = elements(s"parameter_$i").asInstanceOf[UInt]
   def value(i: Int): UInt = {
     val field = packing.fields(i)
     elements(s"word_${field.word}").asInstanceOf[UInt](field.shift + field.width - 1, field.shift)
   }
-
 }
 
 /** A combinational query, refreshed by explicit parameters and state publication. */
@@ -57,9 +55,7 @@ private[IntentionModel] class StorageFunctionQueryBridge(
     (0 until packing.words).map(i => s", bits_$i").mkString
   private val outputs = (0 until packing.words).map(i => s"word_$i = bits_$i;").mkString("\n")
   private val overflowDeclaration = if (exposeOverflow) "" else "bit overflow;"
-  private val overflowCheck = if (exposeOverflow) "" else
-    "assert (!enabled || !overflow) else $error(\"camRead hit count exceeds maxHits\");"
-  setInline(s"$desiredName.sv", s"""module $desiredName(input epoch, input enabled, input active$ports);
+  setInline(s"$desiredName.sv", s"""module $desiredName(input epoch, input active$ports);
     |  import "DPI-C" function void ${StorageFunctionQueries.name(storage, op)}(input bit epoch$args, output bit overflow);
     |  $locals
     |  $overflowDeclaration
@@ -67,7 +63,6 @@ private[IntentionModel] class StorageFunctionQueryBridge(
     |    if (active) begin
     |      ${StorageFunctionQueries.name(storage, op)}(epoch$call, overflow);
     |      $outputs
-    |      $overflowCheck
     |    end else begin
     |      ${(0 until packing.words).map(i => s"word_$i = 64'd0;").mkString("\n")}
     |      overflow = 0;
