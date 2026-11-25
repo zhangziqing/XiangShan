@@ -342,6 +342,7 @@ object StorageIRValidation {
     validate(ir)
     require(ir.entry.totalWidth <= 64, "DPI entry width must be at most 64 bits")
     require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
+    ir.functions.foreach(StorageFunctionCpp.function)
     ir.operations.foreach {
       case _: ReadOp | _: WriteOp | _: WriteFieldOp => ()
       case _ => throw new IllegalArgumentException("CAM/update/foreach DPI lowering is not implemented")
