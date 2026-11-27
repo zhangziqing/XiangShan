@@ -42,11 +42,7 @@ class ModelStorage[T <: Data](
     case None => UnspecifiedInitialState
     case Some(values) =>
       require(values.size == entries, "initial contents must describe every entry")
-      ConstantInitialState(values.map { value =>
-        val bits = value.litOption.getOrElse(
-          throw new IllegalArgumentException("ModelStorage initialization requires complete constants"))
-        bits & StorageLayout.mask(layout.totalWidth)
-      }.toVector)
+      chisel3.StorageLiteral.initial(values, layout)
   }
   private val builder = new StorageIRBuilder(session.allocate(), entries, layout, initial)
   private val wires = ArrayBuffer.empty[UInt]
@@ -119,6 +115,21 @@ class ModelStorage[T <: Data](
   override final def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit =
     recordWrite(index, field.select(gen.cloneType), content, Some(StorageLayout.path(field.path)), source)
 
+  override final def writeMask[D <: Data](mask: Seq[Bool], field: FieldOf[T, D], content: D): Unit = {
+    context()
+    require(mask.size == entries, "write mask must describe every physical slot")
+    val guard = capture((when.cond && VecInit(mask).asUInt.orR).asUInt, 1, UIntType(1))
+    val masks = mask.grouped(64).map { word =>
+      capture(VecInit(word).asUInt, word.size, UIntType(word.size))
+    }.toVector
+    val normalized = Wire(field.select(gen.cloneType).cloneType)
+    normalized := content
+    val path = StorageLayout.path(field.path)
+    val tpe = StorageLayout.field(layout, path)._1
+    val value = capture(normalized.asUInt, StorageLayout.width(tpe), tpe)
+    builder.writeMask(guard, masks, path, value, source)
+  }
+
   private def predicate[P](
     f: (T, P) => Bool, param: P, location: SourceLoc
   ): (FunctionId, Vector[ValueId]) = param match {
@@ -167,24 +178,28 @@ class ModelStorage[T <: Data](
     results.map(_.asTypeOf(prototype).readOnly)
   }
   private def camQuery[P](
-    f: (T, P) => Bool, param: P, query: CamQuery, location: SourceLoc
+    f: (T, P) => Bool, param: P, query: CamQuery, location: SourceLoc, enabled: Option[Bool] = None
   ): Vector[UInt] = {
     context()
     val (fid, params) = predicate(f, param, location)
     val types = query match {
+      case AnyMatch => Vector(UIntType(1))
       case HitVector => Vector.fill(entries)(UIntType(1))
       case HitIndices => Vector.fill(entries)(UIntType(math.max(1, BigInt(entries).bitLength)))
       case ReadMatches(n) =>
         require(n > 0 && n <= entries, "camRead maxHits must be between 1 and entries")
         Vector.fill(n)(Vector(layout.shape, UIntType(1))).flatten
     }
-    val results = queryFunction(fid, params, types, checkOverflow = query.isInstanceOf[ReadMatches])
+    val active = enabled.map(e => capture(e.asUInt, 1, UIntType(1)))
+    val results = queryFunction(fid, params, types, active, query.isInstanceOf[ReadMatches])
     builder.camQuery(query, fid, params,
-      results.zip(types).map { case (d, t) => (d: Data) -> t }, location)
+      results.zip(types).map { case (d, t) => (d: Data) -> t }, location, active)
     results
   }
-  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
-    camQuery(f, arg, HitVector, source).map(_.asBool.readOnly)
+  override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
+    camQuery(f, arg, AnyMatch, source, Some(enabled)).head.asBool.readOnly
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool): Seq[Bool] =
+    camQuery(f, arg, HitVector, source, Some(enabled)).map(_.asBool.readOnly)
   override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] =
     camQuery(f, arg, HitIndices, source).map(_.readOnly)
   override final def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int): Seq[(T, Bool)] =
@@ -213,7 +228,7 @@ class ModelStorage[T <: Data](
     val widths = ports.map(port => builder.data(port.index).getWidth -> builder.data(port.value).getWidth)
     val callbackInputs = StorageCyclePacking.callbackOperands(builder.operations)
     val extraWidths = callbackInputs.map { case (name, value) => name -> builder.data(value).getWidth }
-    val cycle = Module(new StorageCycleBridge(builder.id, widths, initial.isInstanceOf[ConstantInitialState],
+    val cycle = Module(new StorageCycleBridge(builder.id, widths, initial != UnspecifiedInitialState,
       extraWidths, StorageCyclePacking.callbackGuards(builder.operations)))
     callbackInputs.foreach { case (name, value) => connections += cycle.io.extra(name) -> builder.data(value) }
     cycle.io.clock := clock
@@ -360,11 +375,16 @@ object StorageCyclePacking {
       Vector(s"function_guard_${id.value}" -> guard.value) ++
         params.zipWithIndex.map { case (p, i) => s"function_parameter_${id.value}_$i" -> p.value } :+
         (s"function_value_${id.value}" -> value.value)
+    case WriteMaskOp(id, _, guard, masks, _, value, _) =>
+      Vector(s"function_guard_${id.value}" -> guard.value) ++
+        masks.zipWithIndex.map { case (m, i) => s"function_mask_${id.value}_$i" -> m.value } :+
+        (s"function_value_${id.value}" -> value.value)
     case _ => Vector.empty
   }
   def callbackGuards(operations: Vector[StorageOp]): Vector[String] = operations.collect {
     case op: UpdateOp => s"function_guard_${op.id.value}"
     case op: CamWriteOp => s"function_guard_${op.id.value}"
+    case op: WriteMaskOp => s"function_guard_${op.id.value}"
   }
   def fromIR(ir: StorageIR): StorageCyclePacking = {
     val types = ir.values.map(v => v.id -> v.tpe).toMap
@@ -468,6 +488,9 @@ object StorageDPIEmitter {
       val initial = ir.initial match {
         case ConstantInitialState(bits) =>
           s"static const Model_${ir.id.value}::State initial_${ir.id.value}{{${bits.map(u).mkString(", ")}}};"
+        case MaskedInitialState(bits, masks) =>
+          s"static const Model_${ir.id.value}::State initial_${ir.id.value}{{${bits.map(u).mkString(", ")}}};\n" +
+            s"static const Model_${ir.id.value}::State reset_masks_${ir.id.value}{{${masks.map(u).mkString(", ")}}};"
         case UnspecifiedInitialState => ""
       }
       s"""using Model_${ir.id.value} = intention::StorageModel<${ir.entries}, ${ir.entry.totalWidth}>;
@@ -506,13 +529,24 @@ object StorageDPIEmitter {
       val reset = ir.initial match {
         case _: ConstantInitialState =>
           s"if (${operand("reset")}) { next.reset(initial_${ir.id.value}); return; }"
+        case _: MaskedInitialState => ""
         case UnspecifiedInitialState => "(void)inputs_0;"
+      }
+      val partialReset = ir.initial match {
+        case _: MaskedInitialState =>
+          s"if (${operand("reset")}) next.resetMasked(initial_${ir.id.value}, reset_masks_${ir.id.value});"
+        case _ => ""
       }
       val writeIndices = specs.zipWithIndex.map { case ((id, offset, width), i) => id -> (i, offset, width) }.toMap
       val writes = ir.operations.flatMap {
         case op if writeIndices.contains(op.id.value) =>
           val (i, offset, width) = writeIndices(op.id.value)
           Some(s"next.write<$offset, $width>(${operand(s"guard_$i")} != 0, ${operand(s"index_$i")}, ${operand(s"value_$i")});")
+        case op: WriteMaskOp =>
+          val (_, offset, width) = StorageLayout.field(ir.entry, op.fieldPath)
+          Some(op.masks.indices.map { i =>
+            s"next.writeMask<$offset, $width, ${i * 64}>(${operand(s"function_guard_${op.id.value}")} != 0, ${operand(s"function_mask_${op.id.value}_$i")}, ${operand(s"function_value_${op.id.value}")});"
+          }.mkString("\n"))
         case op: UpdateOp => Some(s"next.update(current, ${operand(s"function_guard_${op.id.value}")} != 0, ${StorageFunctionCpp.batchName(op.transform)}{});")
         case op: CamWriteOp =>
           val (_, offset, width) = op.fieldPath.map(StorageLayout.field(ir.entry, _)).getOrElse((ir.entry.shape, 0, ir.entry.totalWidth))
@@ -526,9 +560,10 @@ object StorageDPIEmitter {
          |  const auto &current = storage_${ir.id.value}[epoch != 0];
          |  next = current;
          |  $writes
+         |  $partialReset
          |}""".stripMargin
     }.mkString("\n")
-    s"""// Generated from storage IR schema 1/2. Do not edit.
+    s"""// Generated from storage IR. Do not edit.
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
