@@ -86,7 +86,7 @@ class StorageFunctionPhase extends Phase {
     }
     annotations.flatMap {
       case _: StorageFunctionCaptureAnnotation => Seq.empty
-      case pending: StoragePendingIRAnnotation => Seq(StorageIRAnnotation(StorageIRCodec.encode(pending.finish())))
+      case pending: StoragePendingIRAnnotation => pending.finish(); Seq.empty
       case other => Seq(other)
     }
   }

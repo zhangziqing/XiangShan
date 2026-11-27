@@ -51,6 +51,7 @@ class ModelStorage[T <: Data](
   private val builder = new StorageIRBuilder(session.allocate(), entries, layout, initial)
   private val wires = ArrayBuffer.empty[UInt]
   private val reads = ArrayBuffer.empty[StorageReadBridge]
+  private val functionQueries = ArrayBuffer.empty[StorageFunctionQueryBridge]
   private val batchReads = ArrayBuffer.empty[(ValueId, UInt)]
   private val connections = ArrayBuffer.empty[(Data, Data)]
 
@@ -118,17 +119,76 @@ class ModelStorage[T <: Data](
   override final def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit =
     recordWrite(index, field.select(gen.cloneType), content, Some(StorageLayout.path(field.path)), source)
 
+  private def predicate[P](
+    f: (T, P) => Bool, param: P, location: SourceLoc
+  ): (FunctionId, Vector[ValueId]) = param match {
+    case data: Data =>
+      val paramLayout = StorageLayout.fromData(data)
+      val (fid, _) = builder.function(() => gen.cloneType, Some(() => data.cloneType),
+        (entry: T, p: Option[Data]) => f(entry, p.get.asInstanceOf[P]), None, location)
+      val value = capture(data.asUInt, paramLayout.totalWidth, paramLayout.shape)
+      (fid, Vector(value))
+    case _: Int | _: Long | _: Short | _: Byte | _: Boolean | _: Char | _: String | _: BigInt | () =>
+      val (fid, _) = builder.function(() => gen.cloneType, None,
+        (entry: T, _: Option[Data]) => f(entry, param), None, location)
+      (fid, Vector.empty)
+    case _ => throw new IllegalArgumentException("CAM parameter must be Data or an immutable Scala scalar")
+  }
+  private def queryFunction(
+    function: FunctionId, params: Vector[ValueId], types: Vector[StorageType],
+    enabled: Option[ValueId] = None, checkOverflow: Boolean = false
+  ): Vector[UInt] = {
+    val bridge = Module(new StorageFunctionQueryBridge(builder.id, builder.nextOp, function,
+      params.map(builder.data(_).getWidth), types.map(StorageLayout.width), checkOverflow))
+    functionQueries += bridge
+    // Use the caller's clock, reset and when scope, just like RegStorage.camRead.
+    if (checkOverflow) chisel3.assert(!bridge.io.overflow, "camRead hit count exceeds maxHits")
+    val active = enabled.getOrElse(capture(true.B.asUInt, 1, UIntType(1)))
+    connections += bridge.io.active -> builder.data(active)
+    params.zipWithIndex.foreach { case (value, i) => connections += bridge.io.parameter(i) -> builder.data(value) }
+    types.indices.map(bridge.io.value).toVector
+  }
   private def unsupported[A](operation: String): A =
     throw new IllegalArgumentException(s"ModelStorage $operation callback lowering is not implemented")
-  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] = unsupported("camHitVec")
-  override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] = unsupported("camHitIdx")
-  override final def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int): Seq[(T, Bool)] = unsupported("camRead")
+  override final def update(f: T => T): Unit = unsupported("update")
+  override final def foreach[A <: Data](f: T => A): Seq[A] = {
+    context()
+    val location = source
+    val (fid, prototype) = builder.function(() => gen.cloneType, None,
+      (entry: T, _: Option[Data]) => f(entry), None, location)
+    val tpe = StorageLayout.fromData(prototype).shape
+    val results = queryFunction(fid, Vector.empty, Vector.fill(entries)(tpe))
+    builder.foreach(fid, results.map(x => x: Data), tpe, location)
+    results.map(_.asTypeOf(prototype).readOnly)
+  }
+  private def camQuery[P](
+    f: (T, P) => Bool, param: P, query: CamQuery, location: SourceLoc
+  ): Vector[UInt] = {
+    context()
+    val (fid, params) = predicate(f, param, location)
+    val types = query match {
+      case HitVector => Vector.fill(entries)(UIntType(1))
+      case HitIndices => Vector.fill(entries)(UIntType(math.max(1, BigInt(entries).bitLength)))
+      case ReadMatches(n) =>
+        require(n > 0 && n <= entries, "camRead maxHits must be between 1 and entries")
+        Vector.fill(n)(Vector(layout.shape, UIntType(1))).flatten
+    }
+    val results = queryFunction(fid, params, types, checkOverflow = query.isInstanceOf[ReadMatches])
+    builder.camQuery(query, fid, params,
+      results.zip(types).map { case (d, t) => (d: Data) -> t }, location)
+    results
+  }
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
+    camQuery(f, arg, HitVector, source).map(_.asBool.readOnly)
+  override final def camHitIdx[A](f: (T, A) => Bool, arg: A): Seq[UInt] =
+    camQuery(f, arg, HitIndices, source).map(_.readOnly)
+  override final def camRead[A](f: (T, A) => Bool, arg: A, maxHits: Int): Seq[(T, Bool)] =
+    camQuery(f, arg, ReadMatches(maxHits), source).grouped(2)
+      .map(pair => (pair(0).asTypeOf(gen).readOnly, pair(1).asBool.readOnly)).toVector
   override final def camWrite[P](f: (T, P) => Bool, param: P, content: T): Unit = unsupported("camWrite")
   override final def camWrite[P, D <: Data](
     f: (T, P) => Bool, param: P, field: FieldOf[T, D], content: D
   ): Unit = unsupported("camWriteField")
-  override final def update(f: T => T): Unit = unsupported("update")
-  override final def foreach[A <: Data](f: T => A): Seq[A] = unsupported("foreach")
 
   owner.registerIntentionCallback(() => {
     val ports = builder.writes
@@ -143,6 +203,7 @@ class ModelStorage[T <: Data](
         cycle.io.index(i) -> builder.data(port.index), cycle.io.value(i) -> builder.data(port.value))
     }
     reads.foreach(r => connections += r.io.epoch -> cycle.io.epoch)
+    functionQueries.foreach(r => connections += r.io.epoch -> cycle.io.epoch)
     if (batchReads.nonEmpty) {
       val batch = Module(new StorageReadBatchBridge(layout.totalWidth, builder.id, batchReads.size))
       connections += batch.io.epoch -> cycle.io.epoch
@@ -153,22 +214,21 @@ class ModelStorage[T <: Data](
     builder.closeCapture()
     annotate(new ChiselAnnotation {
       def toFirrtl: Annotation = StorageWiringAnnotation(owner.name,
-        wires.map(_.toTarget.ref).toVector, reads.map(_.instanceName).toVector,
+        wires.map(_.toTarget.ref).toVector, (reads.map(_.instanceName) ++ functionQueries.map(_.instanceName)).toVector,
         reads.map(_.io.index.toRelativeTarget(Some(owner))).toVector,
         connections.map { case (sink, src) =>
           sink.toRelativeTarget(Some(owner)) -> src.toRelativeTarget(Some(owner))
         }.toVector)
     })
     annotate(new ChiselAnnotation {
-      def toFirrtl: Annotation = {
+      def toFirrtl: Annotation = StoragePendingIRAnnotation(() => {
         val ir = builder.seal(owner.toAbsoluteTarget.serialize,
           SignalRef(clock.toAbsoluteTarget.serialize, UIntType(1)),
           ResetSpec(SignalRef(reset.toAbsoluteTarget.serialize, UIntType(1)),
             synchronous = true, activeHigh = true),
-          data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)))
+          data => SignalRef(data.toAbsoluteTarget.serialize, UIntType(data.getWidth)), session.functions)
         session.record(ir)
-        StorageIRAnnotation(StorageIRCodec.encode(ir))
-      }
+      })
     })
   })
 }
@@ -405,17 +465,22 @@ object StorageDPIEmitter {
           s"if (${operand("reset")}) { next.reset(initial_${ir.id.value}); return; }"
         case UnspecifiedInitialState => "(void)inputs_0;"
       }
-      val writes = specs.zipWithIndex.map { case ((_, offset, width), i) =>
-        s"next.write<$offset, $width>(${operand(s"guard_$i")} != 0, ${operand(s"index_$i")}, ${operand(s"value_$i")});"
+      val writeIndices = specs.zipWithIndex.map { case ((id, offset, width), i) => id -> (i, offset, width) }.toMap
+      val writes = ir.operations.flatMap {
+        case op if writeIndices.contains(op.id.value) =>
+          val (i, offset, width) = writeIndices(op.id.value)
+          Some(s"next.write<$offset, $width>(${operand(s"guard_$i")} != 0, ${operand(s"index_$i")}, ${operand(s"value_$i")});")
+        case _ => None
       }.mkString("\n")
       s"""extern "C" void ${cycleName(ir.id)}(svBit epoch, $args) {
          |  auto &next = storage_${ir.id.value}[epoch == 0];
          |  $reset
-         |  next = storage_${ir.id.value}[epoch != 0];
+         |  const auto &current = storage_${ir.id.value}[epoch != 0];
+         |  next = current;
          |  $writes
          |}""".stripMargin
     }.mkString("\n")
-    s"""// Generated from storage IR. Do not edit.
+    s"""// Generated from storage IR schema 1/2. Do not edit.
        |// Reset levels are sampled on each storage clock's rising edge.
        |#include "storage.hpp"
        |#include "svdpi.h"
@@ -423,6 +488,7 @@ object StorageDPIEmitter {
        |$storageModels
        |$readFunctions
        |$readBatches
+       |${ordered.map(StorageFunctionQueries.cpp).mkString("\n")}
        |$cycleFunctions
        |""".stripMargin
   }

@@ -70,8 +70,7 @@ case object HitIndices extends CamQuery
 final case class ReadMatches(maxHits: Int) extends CamQuery
 final case class CamQueryOp(
   id: OpId, ordinal: Int, query: CamQuery, predicate: FunctionId,
-  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc,
-  guard: Option[Operand] = None
+  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc
 ) extends StorageOp
 final case class CamWriteOp(
   id: OpId, ordinal: Int, guard: Operand, predicate: FunctionId,
@@ -305,8 +304,7 @@ object StorageIRValidation {
             "read result anchor mismatch")
         case WriteOp(_, _, g, i, v, _) => guard(g); index(i); require(operand(v) == ir.entry.shape)
         case WriteFieldOp(_, _, g, i, p, v, _) => guard(g); index(i); require(operand(v) == field(Some(p)))
-        case CamQueryOp(_, _, query, p, params, rs, _, g) =>
-          g.foreach(guard)
+        case CamQueryOp(_, _, query, p, params, rs, _) =>
           require(function(p, params).output.shape == UIntType(1))
           query match {
             case HitVector => require(rs.size == ir.entries); rs.foreach(result(_, UIntType(1)))
@@ -344,8 +342,9 @@ object StorageIRValidation {
     require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
     ir.functions.foreach(StorageFunctionCpp.function)
     ir.operations.foreach {
-      case _: ReadOp | _: WriteOp | _: WriteFieldOp => ()
-      case _ => throw new IllegalArgumentException("CAM/update/foreach DPI lowering is not implemented")
+      case _: UpdateOp | _: CamWriteOp =>
+        throw new IllegalArgumentException("update/camWrite DPI lowering is not implemented")
+      case _ => ()
     }
     val types = ir.values.map(v => v.id -> v.tpe).toMap
     ir.operations.foreach {
@@ -366,12 +365,8 @@ private[IntentionModel] final case class StorageWiringAnnotation(
   connections: Vector[(ReferenceTarget, ReferenceTarget)]
 ) extends NoTargetAnnotation with Unserializable
 
-private[IntentionModel] final case class StoragePendingIRAnnotation(finish: () => StorageIR)
+private[IntentionModel] final case class StoragePendingIRAnnotation(finish: () => Unit)
   extends NoTargetAnnotation with Unserializable
-
-final case class StorageIRAnnotation(json: String) extends NoTargetAnnotation with Unserializable {
-  def ir: StorageIR = StorageIRCodec.decode(json)
-}
 
 /** Explicit per-elaboration ownership: IDs restart in a new session. */
 final class StorageIRSession {
@@ -464,12 +459,12 @@ final class StorageIRBuilder(
     ops += ForeachOp(op, ops.size, function, ids, source)
   }
   private[IntentionModel] def camQuery(
-    query: CamQuery, function: FunctionId, guard: ValueId, params: Vector[ValueId],
+    query: CamQuery, function: FunctionId, params: Vector[ValueId],
     results: Vector[(Data, StorageType)], source: SourceLoc
   ): Unit = {
     val op = nextOp
     val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
-    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, Some(Operand(guard)))
+    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source)
   }
   private[IntentionModel] def camWrite(
     function: FunctionId, guard: ValueId, params: Vector[ValueId], path: Option[Vector[FieldStep]],

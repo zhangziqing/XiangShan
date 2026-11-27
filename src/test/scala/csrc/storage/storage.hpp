@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 namespace intention {
@@ -23,6 +24,16 @@ public:
   using State = std::array<Entry, Entries>;
 private:
   State state_{};
+  template<class Function, class... Parameters>
+  std::array<std::uint64_t, Entries> evaluate(Function function, Parameters... parameters) const {
+    if constexpr (std::is_invocable_v<Function, std::uint64_t, Parameters...>) {
+      std::array<std::uint64_t, Entries> result{};
+      for (std::size_t i = 0; i < Entries; ++i) result[i] = function(read(i), parameters...);
+      return result;
+    } else {
+      return function(state_, parameters...);
+    }
+  }
 public:
   std::uint64_t read(std::uint64_t index) const {
     return index < Entries ? state_[static_cast<std::size_t>(index)] : 0;
@@ -30,6 +41,66 @@ public:
   void reset(const State &initial) {
     for (std::size_t i = 0; i < Entries; ++i)
       state_[i] = static_cast<Entry>(initial[i] & mask(Width));
+  }
+  template<class Function>
+  std::array<std::uint64_t, Entries> foreach(Function function) const {
+    return evaluate(function);
+  }
+  template<class Predicate, class... Parameters>
+  std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
+    const auto values = evaluate(predicate, parameters...);
+    std::array<bool, Entries> result{};
+    for (std::size_t i = 0; i < Entries; ++i) result[i] = values[i] != 0;
+    return result;
+  }
+  template<class Predicate, class... Parameters>
+  std::array<std::uint64_t, (Entries + 63) / 64>
+  camHitMask(Predicate predicate, Parameters... parameters) const {
+    const auto hits = camHitVec(predicate, parameters...);
+    std::array<std::uint64_t, (Entries + 63) / 64> result{};
+    std::size_t i = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // Gather eight canonical boolean bytes into eight adjacent mask bits.
+    if (sizeof(bool) == 1) {
+      for (; i + 8 <= Entries; i += 8) {
+        std::uint64_t bytes;
+        std::memcpy(&bytes, hits.data() + i, 8);
+        const auto packed = ((bytes & UINT64_C(0x0101010101010101)) *
+          UINT64_C(0x0102040810204080)) >> 56;
+        result[i / 64] |= packed << (i % 64);
+      }
+    }
+#endif
+    for (; i < Entries; ++i) result[i / 64] |= std::uint64_t(hits[i]) << (i % 64);
+    return result;
+  }
+  template<class Predicate, class... Parameters>
+  std::array<std::uint64_t, Entries> camHitIdx(Predicate predicate, Parameters... parameters) const {
+    const auto values = evaluate(predicate, parameters...);
+    std::array<std::uint64_t, Entries> result{};
+    result.fill(Entries);
+    std::size_t rank = 0;
+    for (std::size_t i = 0; i < Entries; ++i)
+      if (values[i] != 0) result[rank++] = i;
+    return result;
+  }
+  template<std::size_t MaxHits> struct Matches {
+    std::array<std::uint64_t, MaxHits> values{};
+    std::array<bool, MaxHits> hits{};
+    bool overflow = false;
+  };
+  template<std::size_t MaxHits, class Predicate, class... Parameters>
+  Matches<MaxHits> camRead(Predicate predicate, Parameters... parameters) const {
+    static_assert(MaxHits > 0 && MaxHits <= Entries, "invalid CAM hit bound");
+    const auto values = evaluate(predicate, parameters...);
+    Matches<MaxHits> result;
+    std::size_t rank = 0;
+    for (std::size_t i = 0; i < Entries; ++i) {
+      if (values[i] == 0) continue;
+      if (rank == MaxHits) { result.overflow = true; continue; }
+      result.values[rank] = read(i); result.hits[rank] = true; ++rank;
+    }
+    return result;
   }
   template<unsigned Offset, unsigned FieldWidth>
   void write(bool enabled, std::uint64_t index, std::uint64_t value) {
