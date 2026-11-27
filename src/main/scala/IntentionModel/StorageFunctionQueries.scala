@@ -18,6 +18,7 @@ object StorageFunctionQueries {
     val parameters = params.indices.map(i => s", parameter_$i").mkString
     val method = query match {
       case None => "foreach"
+      case Some(AnyMatch) => "camAny"
       case Some(HitVector) => "camHitMask"
       case Some(HitIndices) => "camHitIdx"
       case Some(ReadMatches(n)) => s"camRead<$n>"
@@ -27,6 +28,7 @@ object StorageFunctionQueries {
     } else results.indices.map { i =>
       val value = query match {
         case Some(_: ReadMatches) => if (i % 2 == 0) s"values.values[${i/2}]" else s"values.hits[${i/2}]"
+        case Some(AnyMatch) => "values"
         case _ => s"values[$i]"
       }
       val field = packing.fields(i)

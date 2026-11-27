@@ -51,6 +51,7 @@ final case class ResetSpec(signal: SignalRef, synchronous: Boolean, activeHigh: 
 sealed trait InitialState
 case object UnspecifiedInitialState extends InitialState
 final case class ConstantInitialState(bits: Vector[BigInt]) extends InitialState
+final case class MaskedInitialState(bits: Vector[BigInt], masks: Vector[BigInt]) extends InitialState
 
 sealed trait StorageOp { def id: OpId; def ordinal: Int; def source: SourceLoc }
 final case class ReadOp(
@@ -64,13 +65,20 @@ final case class WriteFieldOp(
   fieldPath: Vector[FieldStep], value: Operand, source: SourceLoc
 ) extends StorageOp
 
+final case class WriteMaskOp(
+  id: OpId, ordinal: Int, guard: Operand, masks: Vector[Operand],
+  fieldPath: Vector[FieldStep], value: Operand, source: SourceLoc
+) extends StorageOp
+
 sealed trait CamQuery
+case object AnyMatch extends CamQuery
 case object HitVector extends CamQuery
 case object HitIndices extends CamQuery
 final case class ReadMatches(maxHits: Int) extends CamQuery
 final case class CamQueryOp(
   id: OpId, ordinal: Int, query: CamQuery, predicate: FunctionId,
-  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc
+  params: Vector[Operand], results: Vector[ValueId], source: SourceLoc,
+  enabled: Option[Operand] = None
 ) extends StorageOp
 final case class CamWriteOp(
   id: OpId, ordinal: Int, guard: Operand, predicate: FunctionId,
@@ -204,13 +212,16 @@ object StorageIRCodec {
   implicit val resetRW: ReadWriter[ResetSpec] = macroRW
   implicit val unspecifiedRW: ReadWriter[UnspecifiedInitialState.type] = macroRW
   implicit val initialBitsRW: ReadWriter[ConstantInitialState] = macroRW
-  implicit val initialRW: ReadWriter[InitialState] = ReadWriter.merge(unspecifiedRW, initialBitsRW)
+  implicit val maskedInitialRW: ReadWriter[MaskedInitialState] = macroRW
+  implicit val initialRW: ReadWriter[InitialState] = ReadWriter.merge(unspecifiedRW, initialBitsRW, maskedInitialRW)
+  implicit val anyMatchRW: ReadWriter[AnyMatch.type] = macroRW
   implicit val hitVecRW: ReadWriter[HitVector.type] = macroRW
   implicit val hitIdxRW: ReadWriter[HitIndices.type] = macroRW
   implicit val matchesRW: ReadWriter[ReadMatches] = macroRW
-  implicit val queryRW: ReadWriter[CamQuery] = ReadWriter.merge(hitVecRW, hitIdxRW, matchesRW)
+  implicit val queryRW: ReadWriter[CamQuery] = ReadWriter.merge(anyMatchRW, hitVecRW, hitIdxRW, matchesRW)
   implicit val readRW: ReadWriter[ReadOp] = macroRW
   implicit val writeRW: ReadWriter[WriteOp] = macroRW
+  implicit val writeMaskRW: ReadWriter[WriteMaskOp] = macroRW
   implicit val writeFieldRW: ReadWriter[WriteFieldOp] = macroRW
   implicit val functionIdRW: ReadWriter[FunctionId] = macroRW
   implicit val camQueryRW: ReadWriter[CamQueryOp] = macroRW
@@ -218,7 +229,7 @@ object StorageIRCodec {
   implicit val updateRW: ReadWriter[UpdateOp] = macroRW
   implicit val foreachRW: ReadWriter[ForeachOp] = macroRW
   implicit val opRW: ReadWriter[StorageOp] =
-    ReadWriter.merge(readRW, writeRW, writeFieldRW, camQueryRW, camWriteRW, updateRW, foreachRW)
+    ReadWriter.merge(readRW, writeRW, writeFieldRW, writeMaskRW, camQueryRW, camWriteRW, updateRW, foreachRW)
   implicit val functionDefRW: ReadWriter[StorageFunctionDef] = macroRW
   implicit val irRW: ReadWriter[StorageIR] = macroRW
 
@@ -235,7 +246,7 @@ object StorageIRCodec {
 
 object StorageIRValidation {
   def validate(ir: StorageIR): Unit = {
-    require(Set(1, 2, StorageIR.CurrentVersion)(ir.schemaVersion), "unsupported storage IR schema")
+    require(ir.schemaVersion >= 1 && ir.schemaVersion <= StorageIR.CurrentVersion, "unsupported storage IR schema")
     require(ir.schemaVersion >= 2 || ir.functions.isEmpty, "schema 1 cannot contain functions")
     require(ir.id.value >= 0 && ir.entries > 0, "invalid storage identity or capacity")
     require(ir.entry == StorageLayout(ir.entry.shape), "inconsistent entry layout or packing")
@@ -248,6 +259,13 @@ object StorageIRValidation {
       case ConstantInitialState(values) =>
         require(values.size == ir.entries, "initial state must describe every entry")
         values.foreach(bits(_, ir.entry.shape))
+      case MaskedInitialState(values, masks) =>
+        require(ir.schemaVersion >= 3, "masked reset requires schema 3")
+        require(values.size == ir.entries && masks.size == ir.entries, "reset must describe every entry")
+        values.zip(masks).foreach { case (value, mask) =>
+          bits(value, ir.entry.shape); bits(mask, ir.entry.shape)
+          require((value & ~mask) == 0, "initial bits outside reset coverage")
+        }
       case UnspecifiedInitialState => ()
     }
     require(ir.values.map(_.id).distinct.size == ir.values.size, "duplicate value ID")
@@ -304,9 +322,20 @@ object StorageIRValidation {
             "read result anchor mismatch")
         case WriteOp(_, _, g, i, v, _) => guard(g); index(i); require(operand(v) == ir.entry.shape)
         case WriteFieldOp(_, _, g, i, p, v, _) => guard(g); index(i); require(operand(v) == field(Some(p)))
-        case CamQueryOp(_, _, query, p, params, rs, _) =>
+        case WriteMaskOp(_, _, g, masks, path, v, _) =>
+          require(ir.schemaVersion >= 3, "physical mask writes require schema 3")
+          guard(g); require(operand(v) == field(Some(path)))
+          require(masks.size == (ir.entries + 63) / 64, "invalid physical mask length")
+          masks.zipWithIndex.foreach { case (m, i) =>
+            require(operand(m) == UIntType(math.min(64, ir.entries - i * 64)), "invalid mask word")
+          }
+        case CamQueryOp(_, _, query, p, params, rs, _, enabled) =>
+          enabled.foreach(guard)
+          require(enabled.isEmpty || (ir.schemaVersion >= 3 && (query == AnyMatch || query == HitVector)),
+            "explicit enable requires a mask or scalar query in schema 3")
           require(function(p, params).output.shape == UIntType(1))
           query match {
+            case AnyMatch => require(ir.schemaVersion >= 3 && rs.size == 1); result(rs.head, UIntType(1))
             case HitVector => require(rs.size == ir.entries); rs.foreach(result(_, UIntType(1)))
             case HitIndices =>
               require(rs.size == ir.entries)
@@ -341,11 +370,6 @@ object StorageIRValidation {
     require(ir.entry.totalWidth <= 64, "DPI entry width must be at most 64 bits")
     require(ir.reset.synchronous && ir.reset.activeHigh, "DPI requires clock-sampled active-high reset semantics")
     ir.functions.foreach(StorageFunctionCpp.function)
-    ir.operations.foreach {
-      case _: UpdateOp | _: CamWriteOp =>
-        throw new IllegalArgumentException("update/camWrite DPI lowering is not implemented")
-      case _ => ()
-    }
     val types = ir.values.map(v => v.id -> v.tpe).toMap
     ir.operations.foreach {
       case ReadOp(_, _, i, _, _) => require(StorageLayout.width(types(i.value)) <= 64, "index exceeds 64 bits")
@@ -446,6 +470,12 @@ final class StorageIRBuilder(
       case None => WriteOp(op, ops.size, Operand(guard), Operand(index), Operand(value), source)
     })
   }
+  private[IntentionModel] def writeMask(
+    guard: ValueId, masks: Vector[ValueId], path: Vector[FieldStep], value: ValueId, source: SourceLoc
+  ): Unit = {
+    val op = nextOp
+    ops += WriteMaskOp(op, ops.size, Operand(guard), masks.map(Operand), path, Operand(value), source)
+  }
   private[IntentionModel] def operations: Vector[StorageOp] = ops.toVector
   private[IntentionModel] def update(guard: ValueId, function: FunctionId, source: SourceLoc): Unit = {
     val op = nextOp
@@ -460,11 +490,11 @@ final class StorageIRBuilder(
   }
   private[IntentionModel] def camQuery(
     query: CamQuery, function: FunctionId, params: Vector[ValueId],
-    results: Vector[(Data, StorageType)], source: SourceLoc
+    results: Vector[(Data, StorageType)], source: SourceLoc, enabled: Option[ValueId] = None
   ): Unit = {
     val op = nextOp
     val ids = results.map { case (data, tpe) => capture(data, tpe, Some(op)) }
-    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source)
+    ops += CamQueryOp(op, ops.size, query, function, params.map(Operand), ids, source, enabled.map(Operand))
   }
   private[IntentionModel] def camWrite(
     function: FunctionId, guard: ValueId, params: Vector[ValueId], path: Option[Vector[FieldStep]],
