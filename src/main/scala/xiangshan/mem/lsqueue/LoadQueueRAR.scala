@@ -27,11 +27,26 @@ import xiangshan.backend.rob.RobPtr
 import xiangshan.mem.Bundles._
 import xiangshan.cache._
 
-/** Ownership and the only uop keys consumed by RAR predicates. */
+/** One physical RAR slot; ownership and release reset, keys and address do not. */
 class LoadQueueRAREntry(implicit p: Parameters) extends XSBundle {
   val allocated = Bool()
+  val released = Bool()
+  val paddr = UInt(16.W)
   val robIdx = new RobPtr
   val lqIdx = new LqPtr
+}
+
+class LoadQueueRARFreeKey(implicit p: Parameters) extends XSBundle {
+  val wb = new LqPtr
+  val redirectRob = new RobPtr
+  val redirectValid = Bool()
+  val flushItself = Bool()
+}
+
+class LoadQueueRARQueryKey(implicit p: Parameters) extends XSBundle {
+  val robIdx = new RobPtr
+  val paddr = UInt(16.W)
+  val tso = Bool()
 }
 
 class LoadQueueRAR(implicit p: Parameters) extends XSModule
@@ -104,24 +119,13 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   //  ROB/LQ keys : ordering and writeback predicates.
   //  PAddr       : physical address.
   //  Released    : DCache released.
-  // Reset ownership without resetting the originally unreset uop keys.
+  // Keep all per-entry predicates in Storage. Only operation results cross to RTL.
   private val entries: Storage[LoadQueueRAREntry] = Storage(
     new LoadQueueRAREntry, LoadQueueRARSize,
-    Some(Seq.fill(LoadQueueRARSize)((new LoadQueueRAREntry).Lit(_.allocated -> false.B))))
+    Some(Seq.fill(LoadQueueRARSize)((new LoadQueueRAREntry).Lit(
+      _.allocated -> false.B, _.released -> false.B))))
   private val allocatedField = FieldOf(new LoadQueueRAREntry)(_.allocated)
-  val paddrModule = Module(new LqPAddrModule(
-    gen = UInt(PartialPAddrBits.W),
-    numEntries = LoadQueueRARSize,
-    numRead = LoadPipelineWidth,
-    numWrite = LoadPipelineWidth,
-    numWBank = LoadQueueNWriteBanks,
-    numWDelay = 1,
-    numCamPort = LoadPipelineWidth,
-    enableCacheLineCheck = false, // Now `RARQueue` has no need to check cacheline.
-    paddrOffset = 0 // If you need to check cacheline, set the offset relative to the original paddr correctly.
-  ))
-  paddrModule.io := DontCare
-  val released = RegInit(VecInit(List.fill(LoadQueueRARSize)(false.B)))
+  private val releasedField = FieldOf(new LoadQueueRAREntry)(_.released)
 
   // freeliset: store valid entries index.
   // +---+---+--------------+-----+-----+
@@ -160,7 +164,6 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
 
   for ((enq, w) <- io.query.map(_.req).zipWithIndex) {
     acceptedVec(w) := false.B
-    paddrModule.io.wen(w) := false.B
     freeList.io.doAllocate(w) := false.B
 
     freeList.io.allocateReq(w) := true.B
@@ -168,7 +171,8 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
     //  Allocate ready
     val offset = PopCount(needEnqueue.take(w))
     val canAccept = freeList.io.canAllocate(offset)
-    val enqIndex = freeList.io.allocateSlot(offset)
+    val enqIndex = Wire(UInt(log2Up(LoadQueueRARSize).W))
+    enqIndex := freeList.io.allocateSlot(offset)
     enq.ready := Mux(needEnqueue(w), canAccept, true.B)
 
     enqIndexVec(w) := enqIndex
@@ -181,20 +185,16 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
       entry.allocated := true.B
       entry.robIdx := enq.bits.uop.robIdx
       entry.lqIdx := enq.bits.uop.lqIdx
-      entries.write(enqIndex, entry)
-
-      //  Write paddr
-      paddrModule.io.wen(w) := true.B
-      paddrModule.io.waddr(w) := enqIndex
-      paddrModule.io.wdata(w) := genPartialPAddr(enq.bits.paddr)
+      entry.paddr := genPartialPAddr(enq.bits.paddr)
 
       //  NC is uncachable and will not be explicitly released.
       //  So NC requests are not allowed to have RAR
-      released(enqIndex) := enq.bits.is_nc || (
+      entry.released := enq.bits.is_nc || (
         enq.bits.data_valid &&
         (release2Cycle.valid && enq.bits.paddr(PAddrBits-1, DCacheLineOffset) === release2Cycle.bits.paddr(PAddrBits-1, DCacheLineOffset)
         || release1Cycle.valid && enq.bits.paddr(PAddrBits-1, DCacheLineOffset) === release1Cycle.bits.paddr(PAddrBits-1, DCacheLineOffset))
       )
+      entries.write(enqIndex, entry)
     }
     val debug_robIdx = enq.bits.uop.robIdx.asUInt
     XSError(
@@ -206,13 +206,20 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   val freeMaskVec = Wire(Vec(LoadQueueRARSize, Bool()))
 
   // Reclaim and report exactly the same current-state matches to FreeList.
-  val canFree = (entry: LoadQueueRAREntry, _: Unit) => {
-    val deqNotBlock = !isBefore(io.ldWbPtr, entry.lqIdx)
-    val needFlush = entry.robIdx.needFlush(io.redirect)
+  val freeKey = Wire(new LoadQueueRARFreeKey)
+  freeKey.wb := io.ldWbPtr
+  freeKey.redirectRob := io.redirect.bits.robIdx
+  freeKey.redirectValid := io.redirect.valid
+  freeKey.flushItself := io.redirect.bits.flushItself()
+  val canFree = (entry: LoadQueueRAREntry, key: LoadQueueRARFreeKey) => {
+    val deqNotBlock = !isBefore(key.wb, entry.lqIdx)
+    val needFlush = key.redirectValid &&
+      ((key.flushItself && entry.robIdx === key.redirectRob) || isAfter(entry.robIdx, key.redirectRob))
     entry.allocated && (deqNotBlock || needFlush)
   }
-  freeMaskVec := VecInit(entries.camHitVec(canFree, ()))
-  entries.camWrite(canFree, (), allocatedField, false.B)
+  val reclaimMask = entries.camHitVec(canFree, freeKey)
+  freeMaskVec := VecInit(reclaimMask)
+  entries.writeMask(reclaimMask, allocatedField, false.B)
 
   // if need replay revoke entry
   val lastCanAccept = GatedRegNext(acceptedVec)
@@ -222,7 +229,8 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
     val revokeValid = revoke && lastCanAccept(w)
     val revokeIndex = lastAllocIndex(w)
 
-    when (entries.read(revokeIndex).allocated && revokeValid) {
+    val revokeAllocated = entries.read(revokeIndex).allocated
+    when (revokeAllocated && revokeValid) {
       entries.writeField(revokeIndex, allocatedField, false.B)
       freeMaskVec(revokeIndex) := true.B
     }
@@ -235,45 +243,25 @@ class LoadQueueRAR(implicit p: Parameters) extends XSModule
   // 1. Physical address match by CAM port, or we're in TSO mode
   // 2. release or nc_with_data is set.
   // 3. Younger than current load instruction.
-  val ldLdViolation = Wire(Vec(LoadPipelineWidth, Bool()))
   for ((query, w) <- io.query.zipWithIndex) {
-    ldLdViolation(w) := false.B
-    paddrModule.io.releaseViolationMdata(w) := genPartialPAddr(query.req.bits.paddr)
-
+    val key = Wire(new LoadQueueRARQueryKey)
+    key.robIdx := query.req.bits.uop.robIdx
+    key.paddr := genPartialPAddr(query.req.bits.paddr)
+    key.tso := io.csrCtrl.tso_enable
+    val violation = entries.camAny((entry: LoadQueueRAREntry, key: LoadQueueRARQueryKey) =>
+      entry.allocated && entry.released &&
+        (key.tso || entry.paddr === key.paddr) && isAfter(entry.robIdx, key.robIdx), key, query.req.valid)
     query.resp.valid := RegNext(query.req.valid)
-    // Generate real violation mask
-    val youngerAllocated = entries.camHitVec((entry: LoadQueueRAREntry, robIdx: RobPtr) => {
-      entry.allocated && isAfter(entry.robIdx, robIdx)
-    }, query.req.bits.uop.robIdx)
-    val matchMaskReg = VecInit(youngerAllocated.zip(paddrModule.io.releaseViolationMmask(w)).zip(released).map {
-      case ((younger, addrMatch), isReleased) => younger && (io.csrCtrl.tso_enable || addrMatch) && isReleased
-    })
-    val matchMask = RegEnable(matchMaskReg, query.req.valid)
-    //  Load-to-Load violation check result
-    val ldLdViolationMask = matchMask
-    ldLdViolationMask.suggestName("ldLdViolationMask_" + w)
-    query.resp.bits.rep_frm_fetch := ParallelORR(ldLdViolationMask)
+    // OR commutes with this common register enable, including invalid-cycle hold.
+    query.resp.bits.rep_frm_fetch := RegEnable(violation, query.req.valid)
   }
 
-
-  // When io.release.valid (release1cycle.valid), it uses the last ld-ld paddr cam port to
-  // update release flag in 1 cycle
-  val releaseVioMask = Reg(Vec(LoadQueueRARSize, Bool()))
-  when (release1Cycle.valid) {
-    paddrModule.io.releaseMdata.takeRight(1)(0) := genPartialPAddr(release1Cycle.bits.paddr)
-  }
-
-  // Preserve the original cycle and priority of physical-slot release updates.
-  val allocatedMask = entries.camHitVec((entry: LoadQueueRAREntry, _: Unit) => entry.allocated, ())
-  val releasePending = RegNext(VecInit(paddrModule.io.releaseMmask.last.zip(allocatedMask).map {
-    case (addrMatch, isAllocated) => addrMatch && isAllocated && release1Cycle.valid
-  }))
-  released.zip(releasePending).foreach { case (isReleased, pending) =>
-    when (pending) {
-      // Missed loads waiting for refill must also observe a matching release.
-      isReleased := true.B
-    }
-  }
+  // Retain the sampled physical slots even if a slot is freed or reused next cycle.
+  // This write is last, preserving its priority over an enqueue's release value.
+  val releaseMatches = entries.camHitVec((entry: LoadQueueRAREntry, hash: UInt) =>
+    entry.allocated && entry.paddr === hash, genPartialPAddr(release1Cycle.bits.paddr), release1Cycle.valid)
+  val releasePending = RegNext(VecInit(releaseMatches))
+  entries.writeMask(releasePending.toSeq, releasedField, true.B)
 
   io.lqFull := freeList.io.empty
 

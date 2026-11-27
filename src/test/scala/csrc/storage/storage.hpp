@@ -42,9 +42,36 @@ public:
     for (std::size_t i = 0; i < Entries; ++i)
       state_[i] = static_cast<Entry>(initial[i] & mask(Width));
   }
+  void resetMasked(const State &initial, const State &masks) {
+    for (std::size_t i = 0; i < Entries; ++i)
+      state_[i] = static_cast<Entry>((state_[i] & ~masks[i]) | (initial[i] & masks[i]));
+  }
   template<class Function>
   std::array<std::uint64_t, Entries> foreach(Function function) const {
     return evaluate(function);
+  }
+  template<class Function>
+  void update(const StorageModel &current, bool enabled, Function function) {
+    if (!enabled) return;
+    const auto values = current.evaluate(function);
+    for (std::size_t i = 0; i < Entries; ++i) write<0, Width>(true, i, values[i]);
+  }
+  template<class Predicate, class... Parameters>
+  bool camAny(Predicate predicate, Parameters... parameters) const {
+    const auto values = evaluate(predicate, parameters...);
+    bool result = false;
+    for (std::size_t i = 0; i < Entries; ++i)
+      result |= values[i] != 0;
+    return result;
+  }
+  template<unsigned Offset, unsigned FieldWidth, std::size_t Base = 0>
+  void writeMask(bool enabled, std::uint64_t selected, std::uint64_t value) {
+    if (!enabled) return;
+    while (selected != 0) {
+      const auto bit = static_cast<unsigned>(__builtin_ctzll(selected));
+      write<Offset, FieldWidth>(true, Base + bit, value);
+      selected &= selected - 1;
+    }
   }
   template<class Predicate, class... Parameters>
   std::array<bool, Entries> camHitVec(Predicate predicate, Parameters... parameters) const {
@@ -101,6 +128,14 @@ public:
       result.values[rank] = read(i); result.hits[rank] = true; ++rank;
     }
     return result;
+  }
+  template<unsigned Offset, unsigned FieldWidth, class Predicate, class... Parameters>
+  void camWrite(const StorageModel &current, bool enabled, std::uint64_t value,
+                Predicate predicate, Parameters... parameters) {
+    if (!enabled) return;
+    const auto matches = current.evaluate(predicate, parameters...);
+    for (std::size_t i = 0; i < Entries; ++i)
+      write<Offset, FieldWidth>(matches[i] != 0, i, value);
   }
   template<unsigned Offset, unsigned FieldWidth>
   void write(bool enabled, std::uint64_t index, std::uint64_t value) {

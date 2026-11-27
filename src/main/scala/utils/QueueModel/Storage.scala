@@ -15,9 +15,17 @@ abstract class Storage[T <: Data](val entries: Int) {
   def writeField[D <: Data](index: UInt, field: FieldOf[T, D], content: D): Unit
 
   /** Returns one current-state match bit per physical slot, without a hit bound.
-    * Validity and query enables belong in the predicate; writes are not forwarded.
+    * A disabled query returns zeros; writes are not forwarded.
     */
-  def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool]
+  def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool = true.B): Seq[Bool]
+
+  /** True when enabled and any current entry matches; disabled queries return false. */
+  def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool = true.B): Bool
+
+  /** Applies a field write to physical slots selected by a previously sampled mask.
+    * Later calls win; predicates and reads still observe committed current state.
+    */
+  def writeMask[D <: Data](mask: Seq[Bool], field: FieldOf[T, D], content: D): Unit
 
   /** Returns `entries` ascending matching indices, padded with the invalid index
     * `entries`. Each unsigned index has width `max(1, log2Ceil(entries + 1))`.
@@ -114,8 +122,18 @@ class RegStorage[T <: Data](
       when(index === slot.U) { field.select(contents(slot)) := content }
     }
 
-  override final def camHitVec[A](f: (T, A) => Bool, arg: A): Seq[Bool] =
-    contents.toSeq.map(entry => f(entry.readOnly, arg).readOnly)
+  override final def camHitVec[A](f: (T, A) => Bool, arg: A, enabled: Bool): Seq[Bool] =
+    contents.toSeq.map(entry => (enabled && f(entry.readOnly, arg)).readOnly)
+
+  override final def camAny[A](f: (T, A) => Bool, arg: A, enabled: Bool): Bool =
+    (enabled && camHitVec(f, arg).reduce(_ || _)).readOnly
+
+  override final def writeMask[D <: Data](mask: Seq[Bool], field: FieldOf[T, D], content: D): Unit = {
+    require(mask.size == entries, "write mask must describe every physical slot")
+    for (slot <- 0 until entries) {
+      when(mask(slot)) { field.select(contents(slot)) := content }
+    }
+  }
 
   private def rankedHitMasks(hits: Seq[Bool], count: Int): Seq[Seq[Bool]] = {
     if (count == 1) Seq(hits)
